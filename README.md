@@ -102,7 +102,7 @@ Com o `llama-server`, o modelo GGUF e o Docker já preparados, execute:
 bash iniciar_tudo.sh
 ```
 
-O inicializador cria uma sessão `tmux` com o modelo, o worker e a interface. Quando o modelo estiver pronto, acesse o endereço exibido no terminal, normalmente:
+O inicializador cria uma sessão `tmux` com o modelo, o worker e a interface. A interface sobe imediatamente; a aba **Sistema** permite acompanhar o carregamento até a API do modelo ficar pronta. Acesse o endereço exibido no terminal, normalmente:
 
 ```text
 http://IP_DO_HOMELAB:8501
@@ -116,6 +116,9 @@ bash iniciar_tudo.sh status
 
 # Abrir a sessão tmux
 bash iniciar_tudo.sh attach
+
+# Encerrar modelo, worker e interface gerenciados pela sessão
+bash encerrar_tudo.sh
 ```
 
 No `tmux`, use `Ctrl+B` seguido de `N` para mudar de janela e `Ctrl+B` seguido de `D` para desconectar. Os processos continuam ativos depois que a sessão SSH é encerrada.
@@ -288,6 +291,7 @@ Esse teste verifica sucesso, falha Python, timeout, cancelamento, snapshot somen
 │   ├── Dockerfile            imagem do executor
 │   └── runner.py             processo interno do contêiner
 ├── iniciar_tudo.sh           inicialização integrada com tmux
+├── encerrar_tudo.sh         encerramento seguro da sessão tmux
 ├── iniciar_modelo.sh         servidor llama.cpp
 ├── iniciar_worker.sh         worker da fila
 ├── iniciar_interface.sh      aplicação Streamlit
@@ -323,3 +327,10 @@ bash verificar_executor.sh
 ```
 
 Ao adicionar dependências disponíveis para scripts gerados, atualize `sandbox/Dockerfile` e reconstrua a imagem.
+## Desenvolvimento com assistência de IA
+
+Esta harness foi desenvolvida com uso intensivo de IA para gerar código, testes e documentação, em um processo iterativo de definição de requisitos, implementação e experimentação no homelab.
+
+O projeto também é um laboratório de aprendizado em AI Engineering. Meu trabalho envolve definir o escopo, discutir as decisões de arquitetura, integrar os componentes e investigar os problemas encontrados durante o uso. A compreensão e a validação do código avançam junto com o desenvolvimento.
+
+Os testes automatizados, as verificações realizadas com componentes simulados e as limitações conhecidas estão documentados para distinguir o que foi implementado do que já foi validado em condições reais.

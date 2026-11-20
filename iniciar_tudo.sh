@@ -42,15 +42,7 @@ if [[ "${1:-}" == '--service' ]]; then
     case "${2:-}" in
         modelo) exec bash iniciar_modelo.sh ;;
         worker) exec bash iniciar_worker.sh ;;
-        interface)
-            echo 'Aguardando a API do Qwen (até 10 minutos)…'
-            ready=0
-            for ((i=0; i<300; i++)); do
-                if api_ready; then ready=1; break; fi
-                sleep 2
-            done
-            [[ "$ready" == 1 ]] || fail 'A API não ficou pronta. Confira a janela modelo e execute novamente após corrigir.'
-            exec bash iniciar_interface.sh ;;
+        interface) exec bash iniciar_interface.sh ;;
         *) fail 'Serviço inválido.' ;;
     esac
 fi
@@ -89,7 +81,7 @@ if tmux_call has-session -t "$SESSION" 2>/dev/null; then
 fi
 
 [[ -x "$PY" ]] || fail 'Falta .venv. Rode python3 -m venv .venv e .venv/bin/pip install -r requirements.txt na pasta da harness.'
-"$PY" -c 'import streamlit,langgraph,langchain_openai,pymupdf4llm,trafilatura,requests' \
+"$PY" -c 'import streamlit,langgraph,langchain_openai,pymupdf4llm,trafilatura,requests,psutil' \
     || fail 'Dependências ausentes; rode .venv/bin/pip install -r requirements.txt'
 for script in iniciar_modelo.sh iniciar_worker.sh iniciar_interface.sh preparar_executor.sh; do
     [[ -f "$APP_DIR/$script" ]] || fail "Arquivo ausente: $script. É necessário o pacote v2 completo."
@@ -119,6 +111,7 @@ fi
 # O tmux pode ter sido iniciado antes destes exports: passar os valores garante
 # que todas as janelas compartilhem os mesmos dados e configuração.
 SERVICE_ENV=(env "HARNESS_DIR=$APP_DIR" "HARNESS_DATA_DIR=$HARNESS_DATA_DIR"
+    "HARNESS_TMUX_SESSION=$SESSION"
     "LLAMA_BASE_URL=$LLAMA_BASE_URL" "LLAMA_MODEL=$LLAMA_MODEL"
     "HARNESS_RUNNER_IMAGE=$HARNESS_RUNNER_IMAGE" "PORT=$PORT"
     "THREADS=${THREADS:-20}" "CONTEXT=${CONTEXT:-262144}"

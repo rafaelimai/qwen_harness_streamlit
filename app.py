@@ -3,10 +3,13 @@ import io
 import json
 import mimetypes
 import os
+import subprocess
+import time
 from pathlib import Path
 from uuid import uuid4
 from zipfile import ZipFile, ZIP_DEFLATED
 
+import psutil
 import requests
 import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, messages_from_dict
@@ -85,7 +88,8 @@ with st.sidebar:
 
 st.title(meta['title'] if meta['title'] != 'Nova conversa' else 'Seu laboratório, em conversa')
 st.caption('Qwen local • ferramentas LangGraph • execução Python em tarefas isoladas')
-chat_tab, docs_tab, jobs_tab, files_tab = st.tabs(['💬 Conversa', '📄 Documentos', '⚙️ Tarefas', '📦 Arquivos'])
+monitor_tab, chat_tab, docs_tab, jobs_tab, files_tab = st.tabs(
+    ['📊 Sistema', '💬 Conversa', '📄 Documentos', '⚙️ Tarefas', '📦 Arquivos'])
 
 with docs_tab:
     st.subheader('Adicionar arquivos')
@@ -153,8 +157,143 @@ def task_panel(root_path: str):
                 st.rerun()
 
 
+def system_temperature():
+    """Retorna a maior temperatura exposta pelo kernel, quando disponível."""
+    try:
+        sensors = psutil.sensors_temperatures()
+    except (AttributeError, OSError):
+        return None
+    readings = [reading.current for group in sensors.values() for reading in group
+                if reading.current is not None]
+    return max(readings) if readings else None
+
+
+def llama_process():
+    """Localiza o llama-server iniciado no host, se estiver em execução."""
+    expected = Path(os.environ.get('LLAMA_SERVER', 'llama-server')).name
+    for process in psutil.process_iter(['name', 'cmdline', 'memory_info', 'create_time']):
+        try:
+            command = process.info['cmdline'] or []
+            executable = Path(command[0]).name if command else process.info['name']
+            if executable == expected or executable == 'llama-server':
+                return process
+        except (psutil.AccessDenied, psutil.NoSuchProcess, IndexError):
+            continue
+    return None
+
+
+def model_log_tail():
+    """Captura as linhas recentes da janela do modelo quando gerenciada pelo tmux."""
+    session = os.environ.get('HARNESS_TMUX_SESSION', 'qwen-harness')
+    if not session.replace('-', '').replace('_', '').isalnum():
+        return ''
+    try:
+        result = subprocess.run(
+            ['tmux', 'capture-pane', '-p', '-t', f'{session}:modelo', '-S', '-60'],
+            capture_output=True, text=True, timeout=1, check=False)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return ''
+    return result.stdout.strip() if result.returncode == 0 else ''
+
+
+def render_model_status(base_url: str, model: str, sampled_at: float):
+    """Mostra prontidão da API e consumo do processo durante o carregamento."""
+    ready = False
+    available = []
+    try:
+        response = requests.get(base_url.rstrip('/') + '/models', timeout=1)
+        response.raise_for_status()
+        available = [item.get('id', '') for item in response.json().get('data', [])]
+        ready = model in available
+    except (requests.RequestException, ValueError, TypeError):
+        pass
+
+    process = llama_process()
+    if ready:
+        st.success(f'Modelo **{model}** pronto para uso.')
+    elif process:
+        st.warning(f'Carregando o modelo **{model}**; a API ainda não está pronta.')
+    else:
+        st.error(f'API indisponível e processo do modelo não encontrado em `{base_url}`.')
+
+    if process:
+        try:
+            info = process.as_dict(attrs=['pid', 'memory_info', 'create_time', 'cpu_times'])
+            cpu_total = info['cpu_times'].user + info['cpu_times'].system
+            previous = st.session_state.get('model_process_sample')
+            cpu_rate = 0.0
+            if previous and previous['pid'] == info['pid']:
+                elapsed = max(sampled_at - previous['sampled_at'], 0.001)
+                cpu_rate = max(cpu_total - previous['cpu_total'], 0) / elapsed * 100
+            st.session_state.model_process_sample = {
+                'pid': info['pid'], 'sampled_at': sampled_at, 'cpu_total': cpu_total}
+            uptime = max(time.time() - info['create_time'], 0)
+            pid_col, cpu_col, memory_col, uptime_col = st.columns(4)
+            pid_col.metric('PID do modelo', str(info['pid']))
+            cpu_col.metric('CPU do modelo', f'{cpu_rate:.1f}%')
+            memory_col.metric('RAM do modelo', f"{info['memory_info'].rss / 1024**3:.1f} GiB")
+            uptime_col.metric('Tempo em execução', f'{uptime / 60:.1f} min')
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            pass
+    elif available:
+        st.caption('A API respondeu com: ' + ', '.join(available))
+
+    logs = model_log_tail()
+    if logs:
+        with st.expander('Carregamento do llama-server', expanded=not ready):
+            st.code(logs, language='text')
+
+
+@st.fragment(run_every='2s')
+def system_monitor(base_url: str, model: str):
+    """Exibe uso dos recursos do host sem recarregar o restante da interface."""
+    sampled_at = time.monotonic()
+    render_model_status(base_url, model, sampled_at)
+    st.divider()
+    cpu = psutil.cpu_percent(interval=None)
+    ram = psutil.virtual_memory()
+    disk = psutil.disk_usage('/')
+    disk_io = psutil.disk_io_counters()
+    temperature = system_temperature()
+
+    read_rate = write_rate = 0.0
+    previous = st.session_state.get('system_monitor_sample')
+    if previous and disk_io:
+        elapsed = max(sampled_at - previous['sampled_at'], 0.001)
+        read_rate = max(disk_io.read_bytes - previous['read_bytes'], 0) / elapsed
+        write_rate = max(disk_io.write_bytes - previous['write_bytes'], 0) / elapsed
+    if disk_io:
+        st.session_state.system_monitor_sample = {
+            'sampled_at': sampled_at,
+            'read_bytes': disk_io.read_bytes,
+            'write_bytes': disk_io.write_bytes,
+        }
+
+    cpu_col, ram_col, disk_col, temp_col = st.columns(4)
+    cpu_col.metric('CPU', f'{cpu:.1f}%')
+    ram_col.metric('RAM', f'{ram.percent:.1f}%',
+                   f'{ram.available / 1024**3:.1f} GiB livres', delta_color='off')
+    disk_col.metric('Disco /', f'{disk.percent:.1f}%',
+                    f'{disk.free / 1024**3:.1f} GiB livres', delta_color='off')
+    temp_col.metric('Temperatura',
+                    f'{temperature:.0f} °C' if temperature is not None else 'Indisponível')
+
+    read_col, write_col, load_col = st.columns(3)
+    read_col.metric('Leitura do disco', f'{read_rate / 1024**2:.1f} MiB/s')
+    write_col.metric('Gravação no disco', f'{write_rate / 1024**2:.1f} MiB/s')
+    try:
+        load_col.metric('Load average', f'{psutil.getloadavg()[0]:.2f}', '1 minuto')
+    except (AttributeError, OSError):
+        load_col.metric('Load average', 'Indisponível')
+
+
 with jobs_tab:
     task_panel(str(root))
+
+with monitor_tab:
+    st.subheader('Recursos do servidor')
+    st.caption('Estado do modelo e métricas do host atualizados automaticamente a cada 2 segundos.')
+    system_monitor(base_url.strip(), model.strip())
 
 with chat_tab:
     st.caption('Exemplo: “Crie um script Python, salve em work/exemplo.py e execute.”')
