@@ -1,0 +1,26 @@
+# Dados locais e conversas
+data/
+*.sqlite3
+*.db
+
+# Ambientes e caches Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Configurações e credenciais locais
+.env
+.env.*
+.streamlit/secrets.toml
+.aws/
+.codex/
+.agents/
+
+# Arquivos de execução
+.iniciar-tmux.lock
+
+# Editores e sistema operacional
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,8 @@
+# Faixas compatíveis: não exigem releases exatos do ambiente de desenvolvimento.
+streamlit>=1.40,<1.66
+langgraph>=0.2.60,<2
+langchain-openai>=0.3,<2
+pymupdf4llm>=0.0.17,<1
+trafilatura>=2,<3
+requests>=2.32,<3
+lxml_html_clean
