@@ -116,7 +116,8 @@ class JobStore:
             raise ValueError('Conversa fora do diretório de dados.')
         return root.name
 
-    def enqueue(self, root: Path, script: str, args: list[str], timeout: int, request_key: str):
+    def enqueue(self, root: Path, script: str, args: list[str], timeout: int, request_key: str,
+                security: dict | None = None):
         """Valida e enfileira uma execução com snapshot imutável e idempotência."""
         session_id = self.session(root)
         script_path = inside(root, script)
@@ -129,7 +130,16 @@ class JobStore:
             raise ValueError('Argumentos inválidos ou grandes demais.')
         if shutil.disk_usage(self.base).free < MAX_SNAPSHOT_BYTES + 512*1024*1024:
             raise ValueError('Espaço livre insuficiente: preserve pelo menos 640 MiB antes de enfileirar.')
-        payload = json.dumps({'script': str(relative), 'args': args, 'timeout': timeout}, sort_keys=True)
+        if security is not None:
+            required = {'decision_id', 'script_sha256', 'policy_version', 'risk'}
+            if set(security) != required or not all(isinstance(security[k], str) for k in required):
+                raise ValueError('Metadados de segurança inválidos.')
+            if sha256(script_path.read_bytes()).hexdigest() != security['script_sha256']:
+                raise ValueError('O script mudou depois da avaliação de segurança.')
+        payload_data = {'script': str(relative), 'args': args, 'timeout': timeout}
+        if security is not None:
+            payload_data['security'] = security
+        payload = json.dumps(payload_data, sort_keys=True)
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
             existing = db.execute('SELECT * FROM jobs WHERE session_id=? AND request_key=?',
@@ -142,6 +152,10 @@ class JobStore:
             directory = root / 'jobs' / job_id
             try:
                 digest = snapshot_session(root, directory / 'snapshot')
+                if security is not None:
+                    frozen = directory / 'snapshot' / relative
+                    if sha256(frozen.read_bytes()).hexdigest() != security['script_sha256']:
+                        raise ValueError('O snapshot diverge do script aprovado; execução cancelada.')
                 (directory / 'logs').mkdir()
                 db.execute('''INSERT INTO jobs
                     (id,session_id,request_key,payload,snapshot_sha256,status,created_at)

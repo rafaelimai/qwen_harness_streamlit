@@ -1,6 +1,7 @@
 """Worker Linux independente da UI. Um job por vez; Docker obrigatório, sem fallback host."""
 import argparse
 import fcntl
+from hashlib import sha256
 import io
 import json
 import os
@@ -156,6 +157,12 @@ def run_job(store, row, engine):
         if store.get(root, row['id'])['cancel_requested']:
             status = 'cancelled'
         else:
+            request = json.loads(row['payload'])
+            security = request.get('security')
+            if security:
+                frozen_script = jobdir / 'snapshot' / request['script']
+                if sha256(frozen_script.read_bytes()).hexdigest() != security['script_sha256']:
+                    raise ValueError('Hash do script diverge da decisão de segurança.')
             engine.create(row, jobdir / 'snapshot')
             store.update(row['id'], status='running')
             process = engine.start(row)
