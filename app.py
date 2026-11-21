@@ -16,12 +16,51 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, messag
 from agente import build_agent, complete_pending_calls
 from ingestao import build_ingestion
 from jobs import JobStore, TERMINAL, data_dir
+from security import SecurityStore, assess_file, format_alerts, safe_to_display
 from storage import (artifacts, create_session, safe_name, save_messages,
                      session_meta, rename_session)
 
 st.set_page_config(page_title='Qwen · Homelab', page_icon='🧪', layout='wide')
 BASE = data_dir()
 BASE.mkdir(parents=True, exist_ok=True)
+UPLOAD_TYPES = ['pdf','csv','json','txt','md','py','sql','yaml','yml','toml']
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_UPLOAD_FILES = 10
+
+
+@st.dialog('Adicionar arquivos à conversa', width='large')
+def upload_dialog(root_path: str):
+    """Explica limites, valida uploads e registra sua avaliação inicial."""
+    active_root = Path(root_path)
+    st.markdown('''
+Envie até **10 arquivos por vez**, com no máximo **20 MiB por arquivo**.
+
+Formatos aceitos: **PDF, CSV, JSON, TXT, Markdown, Python, SQL, YAML e TOML**.
+Os arquivos são salvos em `inputs/`. Arquivos com qualquer risco detectado podem ser
+armazenados e baixados, mas seu conteúdo não será exibido na interface nem retornado por
+ferramentas de leitura.
+''')
+    uploads = st.file_uploader('Selecionar arquivos', type=UPLOAD_TYPES,
+                               accept_multiple_files=True, key='chat_upload_' + active_root.name)
+    if st.button('Enviar arquivos', type='primary', disabled=not uploads,
+                 key='save_upload_' + active_root.name):
+        if len(uploads) > MAX_UPLOAD_FILES:
+            st.error(f'Envie no máximo {MAX_UPLOAD_FILES} arquivos por vez.')
+            return
+        oversized = [upload.name for upload in uploads if upload.size > MAX_UPLOAD_BYTES]
+        if oversized:
+            st.error('Arquivos acima de 20 MiB: ' + ', '.join(oversized))
+            return
+        results = []
+        for upload in uploads:
+            path = active_root / 'inputs' / f'{uuid4().hex[:8]}_{safe_name(upload.name)}'
+            path.write_bytes(upload.getvalue())
+            assessment = assess_file(path, 'uploaded_file')
+            results.append({'path': str(path.relative_to(active_root)),
+                            'risk': assessment['risk'],
+                            'alerts': format_alerts(assessment)})
+        st.session_state.upload_notice = results
+        st.rerun()
 
 if 'root' not in st.session_state:
     st.session_state.root = str(create_session(BASE))
@@ -92,15 +131,8 @@ monitor_tab, chat_tab, docs_tab, jobs_tab, files_tab = st.tabs(
     ['📊 Sistema', '💬 Conversa', '📄 Documentos', '⚙️ Tarefas', '📦 Arquivos'])
 
 with docs_tab:
-    st.subheader('Adicionar arquivos')
-    st.caption('Conversões diretas não dependem do Qwen. PDFs sem texto exigem OCR adicional.')
-    uploads = st.file_uploader('PDFs, dados ou scripts',
-        type=['pdf','csv','json','txt','md','py','sql','yaml','yml','toml'], accept_multiple_files=True)
-    if st.button('Salvar arquivos enviados', disabled=not uploads):
-        for upload in uploads:
-            path = root / 'inputs' / f'{uuid4().hex[:8]}_{safe_name(upload.name)}'
-            path.write_bytes(upload.getvalue())
-        st.success('Arquivos salvos em inputs/. Scripts executáveis precisam ser gravados em work/ pelo agente.')
+    st.subheader('Converter documentos')
+    st.caption('Adicione arquivos pelo botão + ao lado da mensagem. PDFs sem texto exigem OCR adicional.')
     pdfs = sorted((root / 'inputs').glob('*.pdf'))
     selected_pdf = st.selectbox('PDF salvo nesta conversa', [str(p.relative_to(root)) for p in pdfs], index=0 if pdfs else None)
     if st.button('Converter PDF para Markdown', disabled=not pdfs):
@@ -310,11 +342,46 @@ with chat_tab:
                     st.json(call['args'])
         elif isinstance(message, ToolMessage):
             with st.expander('Resultado da ferramenta'):
-                st.code(str(message.content), language='json')
+                try:
+                    tool_result = json.loads(message.content)
+                except (ValueError, TypeError):
+                    tool_result = None
+                assessment = tool_result.get('security') if isinstance(tool_result, dict) else None
+                if assessment and not safe_to_display(assessment):
+                    st.warning('Conteúdo ocultado devido a risco de segurança: ' + assessment['risk'])
+                    visible = dict(tool_result)
+                    visible.pop('text', None)
+                    if isinstance(visible.get('matches'), list):
+                        visible['matches'] = [dict(item, text=None) if 'text' in item else item
+                                              for item in visible['matches']]
+                    st.json(visible)
+                else:
+                    st.code(str(message.content), language='json')
     # Opções de ask_user podem ser respondidas com um clique ou por texto livre.
     for previous in reversed(st.session_state.messages):
         if isinstance(previous, HumanMessage):
             break
+        if isinstance(previous, ToolMessage) and previous.name == 'run_python':
+            try:
+                decision = json.loads(previous.content)
+                if decision.get('awaiting_approval'):
+                    security_id = decision['security_decision_id']
+                    approve, reject = st.columns(2)
+                    if approve.button('Aprovar esta execução', type='primary',
+                                      key='approve_' + security_id):
+                        SecurityStore(root).resolve(security_id, True)
+                        st.session_state.pending_prompt = (
+                            f'Aprovação humana registrada para {security_id}. '
+                            f'Execute novamente {decision["script"]} usando esse approval_id e os mesmos parâmetros.')
+                        st.rerun()
+                    if reject.button('Rejeitar', key='reject_' + security_id):
+                        SecurityStore(root).resolve(security_id, False)
+                        st.session_state.pending_prompt = (
+                            f'Rejeitei a execução associada a {security_id}. Não execute esse script.')
+                        st.rerun()
+                    break
+            except (ValueError, TypeError, KeyError):
+                pass
         if isinstance(previous, ToolMessage) and previous.name == 'ask_user':
             try:
                 question = json.loads(previous.content)
@@ -325,7 +392,22 @@ with chat_tab:
             except (ValueError, TypeError):
                 pass
             break
-    prompt = st.chat_input('O que vamos investigar?')
+    notice = st.session_state.pop('upload_notice', None)
+    if notice:
+        for item in notice:
+            if item['risk'] == 'low':
+                st.success(f"Arquivo salvo: `{item['path']}`")
+            else:
+                st.warning(f"Arquivo salvo, mas com conteúdo ocultado: `{item['path']}` (risco {item['risk']}).")
+                for alert in item['alerts']:
+                    st.caption(alert)
+    upload_col, message_col = st.columns([0.08, 0.92], vertical_alignment='bottom')
+    with upload_col:
+        if st.button('＋', help='Adicionar arquivos', use_container_width=True,
+                     key='open_upload_' + root.name):
+            upload_dialog(str(root))
+    with message_col:
+        prompt = st.chat_input('O que vamos investigar?')
     pending = st.session_state.pop('pending_prompt', None)
     prompt = prompt or pending
     if prompt:
@@ -368,13 +450,19 @@ with files_tab:
         size = file.stat().st_size
         st.caption(f'{selected_file} · {size / 1024:.1f} KiB')
         if size <= 128 * 1024 * 1024:
-            if file.suffix.lower() in ('.md','.json','.txt','.py','.sql','.csv','.yaml','.yml','.toml','.log'):
+            assessment = assess_file(file, 'artifact_preview')
+            if (file.suffix.lower() in ('.md','.json','.txt','.py','.sql','.csv','.yaml','.yml','.toml','.log')
+                    and safe_to_display(assessment)):
                 with file.open('r', encoding='utf-8', errors='replace') as source:
                     text = source.read(15000)
                 languages = {'.py':'python','.sql':'sql','.json':'json','.md':'markdown','.csv':'text'}
                 st.code(text, language=languages.get(file.suffix.lower(), 'text'))
                 if size > 15000:
                     st.caption('Prévia limitada; o download contém o arquivo completo.')
+            elif not safe_to_display(assessment):
+                st.warning('Prévia ocultada devido a risco de segurança: ' + assessment['risk'])
+                for alert in format_alerts(assessment):
+                    st.caption(alert)
             st.download_button('Baixar arquivo', file.read_bytes(), file_name=file.name,
                                mime=mimetypes.guess_type(file.name)[0] or 'application/octet-stream')
         else:

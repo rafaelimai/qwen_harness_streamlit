@@ -1,5 +1,9 @@
 # Qwen Homelab
 
+> A classificação de entradas, o gate de execução Python, a aprovação humana,
+> a detecção de ofuscação/Base64 e a auditoria estão documentados em
+> [SECURITY_GUARD.md](SECURITY_GUARD.md).
+
 Interface local para conversar com modelos servidos pelo `llama.cpp`, processar documentos e executar código Python em contêineres isolados.
 
 O projeto combina Streamlit, LangGraph, SQLite e Docker em uma aplicação voltada para uso pessoal em homelab. Cada conversa possui arquivos, histórico e tarefas próprios. O modelo pode ler e produzir artefatos, converter PDFs e páginas HTML, pedir esclarecimentos e enfileirar scripts sem executar código diretamente no processo da interface.
