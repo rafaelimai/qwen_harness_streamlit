@@ -187,9 +187,15 @@ Os resultados de uma tarefa ficam em `outputs/jobs/<job_id>/`. O snapshot usado 
 | `run_python` | Enfileira um script `.py` existente em `work/` |
 | `get_job_status` | Consulta estado, logs, código de saída e artefatos |
 | `cancel_job` | Cancela uma tarefa na fila ou em execução |
-| `ask_user` | Interrompe o turno para solicitar uma informação essencial |
+| `ask_user` | Interrompe o turno e exibe uma pergunta com até 4 alternativas mais “Outros” |
 
-As chamadas são serializadas. Uma pergunta feita com `ask_user` tem prioridade e encerra o turno para que o usuário responda antes da continuação.
+As chamadas são serializadas. Uma pergunta feita com `ask_user` tem prioridade e encerra o turno para que o usuário responda antes da continuação. A interface acrescenta “Outros” automaticamente; ao selecioná-la, abre um campo de texto livre antes do envio.
+
+Cada resposta a `ask_user` também é preservada em `decisions.json`, com pergunta, alternativas, escolha e horário. A interface apresenta esse histórico em **Rastreio de escolhas**. O agente recebe as escolhas anteriores como contexto para formular perguntas dependentes, evitar repetição e pedir confirmação quando uma resposta nova parecer contradizer uma decisão anterior; nenhuma versão é apagada silenciosamente.
+
+Quando uma pergunta oferece alternativas, a harness faz uma única consulta adicional à LLM para pré-calcular a possível próxima pergunta de cada ramificação. As respostas válidas ficam em `question-cache.json`. Depois da escolha do usuário, a ramificação correspondente pode ser exibida sem uma nova inferência principal; falhas ou respostas inválidas no pré-cálculo apenas descartam a otimização e preservam o fluxo normal. A conversa também solicita rolagem suave para o conteúdo mais recente após cada atualização.
+
+Perguntas relacionadas são encapsuladas em ciclos persistidos em `question-cycles.json`. Ao abrir um ciclo, a LLM declara seu objetivo e a `definition-of-done`; a interface mostra esses critérios e a quantidade de perguntas realizadas. Enquanto houver critério pendente, o agente apresenta uma pergunta por turno. Quando deixa o modo de perguntas para retomar ferramentas ou responder conclusivamente, a harness marca o ciclo como concluído. Uma necessidade posterior abre um novo ciclo sem apagar os anteriores.
 
 ## Isolamento das execuções
 
@@ -242,7 +248,11 @@ Use o mesmo `HARNESS_DATA_DIR` e `HARNESS_RUNNER_IMAGE` na interface e no worker
 
 ## Persistência
 
-As conversas ficam em `data/`, junto com o banco `jobs.sqlite3`. Cada tarefa registra horários, argumentos, hash do snapshot, estado, logs e artefatos.
+As conversas ficam em `data/`, junto com o banco `jobs.sqlite3`. `conversation.json` preserva mensagens, chamadas de ferramentas e seus resultados; `session.json` guarda título e os parâmetros de geração usados por aquela conversa (`base_url`, modelo/alias, temperatura e máximo de tokens). Ao reabrir uma conversa, a interface restaura o histórico e esses parâmetros automaticamente. Credenciais não são persistidas.
+
+Decisões, ciclos e perguntas pré-calculadas ficam em arquivos próprios na mesma pasta da conversa. O estado interno do servidor de inferência — como KV cache, seed e flags usadas para iniciar o llama.cpp — não é serializado; portanto, retomar preserva o contexto lógico e a configuração da interface, mas não garante reprodução bit a bit de uma geração anterior.
+
+Cada tarefa registra horários, argumentos, hash do snapshot, estado, logs, artefatos, número da tentativa, token ativo e prazo de tomada de posse.
 
 Estados possíveis:
 
@@ -254,7 +264,13 @@ queued → starting → running → succeeded
                             ↘ interrupted
 ```
 
-Um lock impede dois workers de consumirem a mesma fila. Depois de uma reinicialização, tarefas que estavam em execução são marcadas como `interrupted` e não são repetidas automaticamente. Tarefas ainda em `queued` permanecem disponíveis.
+Cada processo executa uma tarefa por vez, mas vários workers podem consumir a mesma fila. A reivindicação SQLite é atômica e cria um token exclusivo por tentativa. O lease não é renovado: seu vencimento apenas permite que outro worker tome posse; sozinho, ele não invalida o titular atual.
+
+Quando uma nova tentativa toma posse, o token anterior fica obsoleto. Atualizações de estado e conclusão usam um `UPDATE` condicionado ao token ativo, portanto a execução antiga não consegue sobrescrever o resultado. O worker antigo detecta a substituição durante sua consulta periódica e encerra seu próprio contêiner. Containers, logs e diretórios de artefatos também incluem o token da tentativa para não colidirem entre si.
+
+Por padrão, o lease dura o timeout solicitado pela tarefa mais 60 segundos de margem operacional. Uma tarefa em estado terminal não pode ser retomada. A migração do banco ocorre automaticamente; tarefas `starting` ou `running` de versões anteriores, que não tinham lease, tornam-se elegíveis para retomada.
+
+O racional, os cenários concorrentes e a rubrica usados como base de discussão estão em [`proposta_tokens_execucao_harness.md`](proposta_tokens_execucao_harness.md).
 
 ## Testes
 
@@ -270,7 +286,7 @@ Execute a suíte local:
 .venv/bin/python -m pytest -q
 ```
 
-Os testes cobrem conversão de documentos, isolamento de caminhos, persistência SQLite, idempotência, ciclo de ferramentas, interface, limites de artefatos e o lifecycle do worker com um backend simulado.
+Os testes cobrem conversão de documentos, isolamento de caminhos, persistência SQLite, idempotência, ciclo de ferramentas, interface, limites de artefatos e o lifecycle do worker com um backend simulado. Também exercitam reivindicação e retomada concorrentes com conexões SQLite distintas, expiração sem substituição e fencing do token antigo.
 
 Para executar a integração com Docker real:
 

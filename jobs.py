@@ -1,6 +1,6 @@
 """Fila SQLite e snapshots imutáveis. Não executa comandos no processo da UI."""
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
 import os
@@ -17,6 +17,7 @@ MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
 MAX_SNAPSHOT_FILES = 2000
 MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 MAX_OUTPUT_FILES = 1000
+LEASE_GRACE_SECONDS = 60
 
 
 def data_dir():
@@ -27,6 +28,17 @@ def data_dir():
 def now():
     """Retorna o instante UTC atual em formato ISO 8601."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def instant(value=None):
+    """Normaliza um instante UTC injetável para comparações e testes determinísticos."""
+    if value is None:
+        return datetime.now(timezone.utc)
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def snapshot_session(root: Path, target: Path) -> str:
@@ -88,12 +100,26 @@ class JobStore:
                   cancel_requested INTEGER NOT NULL DEFAULT 0,
                   created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
                   exit_code INTEGER, error TEXT, artifacts TEXT NOT NULL DEFAULT '[]',
+                  active_token TEXT, lease_expires_at TEXT,
+                  attempt_number INTEGER NOT NULL DEFAULT 0,
                   UNIQUE(session_id, request_key)
                 );
                 CREATE TABLE IF NOT EXISTS worker_state (
                   id INTEGER PRIMARY KEY CHECK(id=1), heartbeat TEXT NOT NULL
                 );
             ''')
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
+            migrations = {
+                'active_token': 'ALTER TABLE jobs ADD COLUMN active_token TEXT',
+                'lease_expires_at': 'ALTER TABLE jobs ADD COLUMN lease_expires_at TEXT',
+                'attempt_number': 'ALTER TABLE jobs ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 0',
+            }
+            for column, statement in migrations.items():
+                if column not in columns:
+                    db.execute(statement)
+            # Execuções de versões anteriores não possuem lease e não poderiam ser retomadas.
+            db.execute("UPDATE jobs SET lease_expires_at=? WHERE status IN ('starting','running') AND lease_expires_at IS NULL",
+                       (now(),))
 
     @contextmanager
     def db(self):
@@ -182,10 +208,14 @@ class JobStore:
         result['cancel_requested'] = bool(row['cancel_requested'])
         result['request'] = json.loads(row['payload'])
         result['artifacts'] = json.loads(row['artifacts'])
+        result['attempt_number'] = row['attempt_number']
         root = self.base / row['session_id']
         for stream in ('stdout','stderr'):
-            relative = Path('jobs') / row['id'] / 'logs' / f'{stream}.log'
+            relative = Path('jobs') / row['id'] / 'attempts' / (row['active_token'] or 'legacy') / 'logs' / f'{stream}.log'
+            legacy = Path('jobs') / row['id'] / 'logs' / f'{stream}.log'
             path = root / relative
+            if not path.exists() and (root / legacy).exists():
+                relative, path = legacy, root / legacy
             if path.exists():
                 with path.open('rb') as f:
                     f.seek(max(0, path.stat().st_size - 8000))
@@ -205,31 +235,60 @@ class JobStore:
         """Solicita o cancelamento de uma tarefa ainda não terminal."""
         session_id = self.session(root)
         with self.db() as db:
-            db.execute('''UPDATE jobs SET cancel_requested=1,
-                status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,
-                finished_at=CASE WHEN status='queued' THEN ? ELSE finished_at END
+            db.execute('''UPDATE jobs SET cancel_requested=1, status='cancelled', finished_at=?
                 WHERE id=? AND session_id=? AND status NOT IN ('succeeded','failed','cancelled','timed_out','interrupted')''',
                 (now(), job_id, session_id))
         return self.get(root, job_id)
 
-    def claim(self):
-        """Reserva atomicamente a tarefa mais antiga que aguarda execução."""
+    def claim(self, at=None, lease_seconds=None):
+        """Reserva ou retoma atomicamente uma tarefa e cria um token de tentativa."""
+        current = instant(at)
+        current_text = current.isoformat()
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1").fetchone()
+            row = db.execute('''SELECT * FROM jobs
+                WHERE cancel_requested=0 AND (
+                  status='queued' OR
+                  (status IN ('starting','running') AND lease_expires_at IS NOT NULL AND lease_expires_at<=?)
+                )
+                ORDER BY CASE WHEN status='queued' THEN 0 ELSE 1 END, created_at LIMIT 1''',
+                (current_text,)).fetchone()
             if row:
-                db.execute("UPDATE jobs SET status='starting', started_at=? WHERE id=?", (now(), row['id']))
-                return dict(row)
+                token = uuid4().hex
+                requested = json.loads(row['payload'])['timeout']
+                duration = lease_seconds if lease_seconds is not None else requested + LEASE_GRACE_SECONDS
+                if duration <= 0:
+                    raise ValueError('O lease precisa ser positivo.')
+                expires = (current + timedelta(seconds=duration)).isoformat()
+                changed = db.execute('''UPDATE jobs SET status='starting', started_at=?, finished_at=NULL,
+                    exit_code=NULL, error=NULL, artifacts='[]', active_token=?, lease_expires_at=?,
+                    attempt_number=attempt_number+1
+                    WHERE id=? AND (status='queued' OR
+                      (status IN ('starting','running') AND lease_expires_at IS NOT NULL AND lease_expires_at<=?))''',
+                    (current_text, token, expires, row['id'], current_text))
+                if changed.rowcount != 1:
+                    return None
+                claimed = db.execute('SELECT * FROM jobs WHERE id=?', (row['id'],)).fetchone()
+                return dict(claimed)
         return None
 
-    def update(self, job_id, **fields):
-        """Atualiza os campos operacionais permitidos de uma tarefa."""
+    def update_attempt(self, job_id, token, **fields):
+        """Atualiza uma tentativa somente se seu token ainda detiver a tarefa."""
         allowed = {'status','started_at','finished_at','exit_code','error','artifacts'}
         if not fields or not set(fields) <= allowed:
             raise ValueError('Campos inválidos.')
         with self.db() as db:
-            db.execute('UPDATE jobs SET ' + ','.join(k+'=?' for k in fields) + ' WHERE id=?',
-                       [*fields.values(), job_id])
+            changed = db.execute('UPDATE jobs SET ' + ','.join(k+'=?' for k in fields) +
+                " WHERE id=? AND active_token=? AND status IN ('starting','running')",
+                [*fields.values(), job_id, token])
+        return changed.rowcount == 1
+
+    def token_is_active(self, job_id, token):
+        """Informa se uma tentativa ainda é a titular, independentemente do prazo do lease."""
+        with self.db() as db:
+            row = db.execute("SELECT 1 FROM jobs WHERE id=? AND active_token=? AND status IN ('starting','running')",
+                             (job_id, token)).fetchone()
+        return row is not None
 
     def heartbeat(self):
         """Registra o instante do último sinal de vida do worker."""
@@ -246,6 +305,6 @@ class JobStore:
         return 'Worker ativo.' if age < 15 else f'Worker sem sinal há {int(age)} s.'
 
     def unfinished(self):
-        """Retorna tarefas que podem ter sido interrompidas por uma queda do worker."""
+        """Retorna tentativas em andamento; a retomada depende do vencimento do lease."""
         with self.db() as db:
             return [dict(r) for r in db.execute("SELECT * FROM jobs WHERE status IN ('starting','running')")]

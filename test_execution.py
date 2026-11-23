@@ -5,13 +5,18 @@ from pathlib import Path
 import subprocess
 import sys
 import tarfile
+import threading
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
-from storage import create_session, write_text_file, artifacts, rename_session, session_meta
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from storage import (artifacts, create_session, decision_log, record_decision,
+                     active_question_cycle, cache_followups, cached_followup,
+                     question_cache, question_cycles, rename_session, session_meta,
+                     save_session_settings, session_settings, write_text_file)
 from jobs import JobStore
-from agente import build_agent, make_tools
+from agente import _plain_options, _plain_question, build_agent, make_tools
 from worker import extract_outputs, run_job, recover, DockerEngine
 from security import SecurityStore, assess_content, assess_python, decision_for
 
@@ -207,8 +212,35 @@ def test_worker_cancellation(tmp_path):
     assert engine.removed == 1
 
 
+def test_stale_worker_stops_without_overwriting_new_attempt(tmp_path):
+    """Faz o worker antigo detectar a tomada de posse e abandonar sua finalização."""
+    root, store, job = setup_job(tmp_path)
+    old = store.claim(lease_seconds=1)
+
+    class TakeoverEngine(FakeEngine):
+        """Substitui o token enquanto a primeira tentativa ainda executa."""
+
+        def __init__(self):
+            super().__init__()
+            self.new = None
+
+        def result(self, row):
+            self.new = store.claim(at=datetime.now(timezone.utc) + timedelta(seconds=2), lease_seconds=30)
+            return None
+
+    engine = TakeoverEngine()
+    with patch('worker.time.sleep'):
+        run_job(store, old, engine)
+    current = store.get(root, job['job_id'])
+    assert engine.removed == 1
+    assert engine.new is not None
+    assert current['status'] == 'starting'
+    assert current['attempt_number'] == 2
+    assert not store.token_is_active(job['job_id'], old['active_token'])
+
+
 def test_worker_wall_timeout_and_recovery(tmp_path):
-    """Valida o prazo do worker e a recuperação de tarefas interrompidas."""
+    """Valida o prazo do worker e preserva tentativas até seu lease vencer."""
     root, store, job = setup_job(tmp_path)
     row = store.claim()
     engine = FakeEngine()
@@ -216,10 +248,79 @@ def test_worker_wall_timeout_and_recovery(tmp_path):
         run_job(store, row, engine)
     assert store.get(root, job['job_id'])['status'] == 'timed_out'
     another = store.enqueue(root, 'work/test.py', [], 2, 'new')
-    store.claim()
+    claimed = store.claim()
     recover(store, engine)
-    assert store.get(root, another['job_id'])['status'] == 'interrupted'
+    assert store.get(root, another['job_id'])['status'] == 'starting'
     assert store.claim() is None
+    assert store.token_is_active(another['job_id'], claimed['active_token'])
+
+
+def test_lease_expiry_only_enables_takeover(tmp_path):
+    """Mantém o token válido após o prazo até outra tentativa tomar posse."""
+    root, store, job = setup_job(tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    first = store.claim(at=start, lease_seconds=30)
+    assert store.claim(at=start + timedelta(seconds=29)) is None
+    assert store.token_is_active(job['job_id'], first['active_token'])
+    assert store.update_attempt(job['job_id'], first['active_token'], status='running')
+    assert store.token_is_active(job['job_id'], first['active_token'])
+    second = store.claim(at=start + timedelta(seconds=31), lease_seconds=30)
+    assert second['active_token'] != first['active_token']
+    assert second['attempt_number'] == 2
+    assert not store.token_is_active(job['job_id'], first['active_token'])
+    assert not store.update_attempt(job['job_id'], first['active_token'], status='succeeded',
+                                    finished_at=(start + timedelta(seconds=32)).isoformat())
+    assert store.update_attempt(job['job_id'], second['active_token'], status='succeeded',
+                                finished_at=(start + timedelta(seconds=32)).isoformat())
+    assert store.get(root, job['job_id'])['status'] == 'succeeded'
+    assert store.claim(at=start + timedelta(days=1)) is None
+
+
+def test_concurrent_claim_has_exactly_one_winner(tmp_path):
+    """Exercita conexões SQLite reais sem serialização por trava Python."""
+    store = JobStore(tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for index in range(20):
+        root = create_session(tmp_path)
+        write_text_file(root, 'work/test.py', 'print("OK")')
+        store.enqueue(root, 'work/test.py', [], 10, f'race-{index}')
+        barrier = threading.Barrier(2)
+        results = []
+
+        def compete():
+            barrier.wait()
+            results.append(JobStore(tmp_path).claim(at=start, lease_seconds=30))
+
+        workers = [threading.Thread(target=compete) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+        assert all(not worker.is_alive() for worker in workers)
+        assert sum(result is not None for result in results) == 1
+
+
+def test_concurrent_takeover_has_exactly_one_winner(tmp_path):
+    """Garante titular único quando dois workers disputam uma tarefa expirada."""
+    _, store, job = setup_job(tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    first = store.claim(at=start, lease_seconds=30)
+    barrier = threading.Barrier(2)
+    results = []
+
+    def compete():
+        barrier.wait()
+        results.append(JobStore(tmp_path).claim(at=start + timedelta(seconds=31), lease_seconds=30))
+
+    workers = [threading.Thread(target=compete) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1
+    assert winners[0]['active_token'] != first['active_token']
+    assert not store.token_is_active(job['job_id'], first['active_token'])
 
 
 @pytest.mark.parametrize('name,kind', [('../bad', 'file'),('/tmp/bad', 'file'),('link','link')])
@@ -298,8 +399,156 @@ def test_ask_user_pauses_before_other_tools(tmp_path):
         result = build_agent(root,'http://localhost:8080/v1','qwen',0,128).invoke(
             {'messages':[HumanMessage(content='Gere um arquivo')]}, config={'recursion_limit': 8})
     assert 'Qual formato?' in result['messages'][-1].content
-    assert 'CSV' in result['messages'][-1].content
+    question = next(message for message in result['messages']
+                    if isinstance(message, ToolMessage) and message.name == 'ask_user')
+    assert json.loads(question.content)['options'] == ['CSV', 'JSON']
     assert not (root / 'work/no.py').exists()
+
+
+def test_ask_user_limits_options_and_reserves_other(tmp_path):
+    """Mantém até quatro opções da LLM e deixa Outros sob controle da interface."""
+    root = create_session(tmp_path)
+    ask = {tool.name: tool for tool in make_tools(root)}['ask_user']
+    result = ask.invoke({'question': 'Qual formato?', 'options': [' CSV ', 'JSON']})
+    assert result['options'] == ['CSV', 'JSON']
+    with pytest.raises(ValueError, match='no máximo 4'):
+        ask.invoke({'question': 'Escolha', 'options': ['A', 'B', 'C', 'D', 'E']})
+    cleaned = ask.invoke({'question': 'Escolha',
+                          'options': ['[ ] A', '[x] B', 'Outros (especifique)']})
+    assert cleaned['options'] == ['A', 'B']
+
+
+def test_question_cycle_tracks_definition_and_closes_on_resume(tmp_path):
+    """Mantém perguntas no ciclo até a LLM retomar o trabalho após cumprir o DoD."""
+    root = create_session(tmp_path)
+    ask = {tool.name: tool for tool in make_tools(root)}['ask_user']
+    result = ask.invoke({
+        'question':'Qual formato?', 'options':['CSV','JSON'],
+        'cycle_goal':'Definir a exportação',
+        'definition_of_done':['Formato definido', 'Contradições resolvidas'],
+    })
+    assert result['question_cycle']['status'] == 'active'
+    assert active_question_cycle(root)['definition_of_done'][0] == 'Formato definido'
+
+    class FinishedModel:
+        def __init__(self, **kw):
+            pass
+        def bind_tools(self, tools):
+            return self
+        def invoke(self, messages):
+            return AIMessage(content='Critérios atendidos; retomando a execução.')
+
+    with patch('agente.ChatOpenAI', FinishedModel):
+        build_agent(root, 'http://localhost:8080/v1', 'qwen', 0, 128).invoke(
+            {'messages':[HumanMessage(content='CSV')]}, config={'recursion_limit':8})
+    assert active_question_cycle(root) is None
+    assert question_cycles(root)[-1]['status'] == 'completed'
+
+
+def test_decision_log_preserves_changes_and_reaches_model(tmp_path):
+    """Persiste todas as escolhas e fornece o histórico para revisão de contradições."""
+    root = create_session(tmp_path)
+    first = record_decision(root, 'Qual estilo?', 'Pixel art', ['Pixel art', 'Vetor'])
+    second = record_decision(root, 'Qual estilo?', 'Vetor', ['Pixel art', 'Vetor'])
+    assert [entry['answer'] for entry in decision_log(root)] == ['Pixel art', 'Vetor']
+    assert first['id'] != second['id'] and second['sequence'] == 2
+
+    class FakeModel:
+        def __init__(self, **kw):
+            pass
+
+        def bind_tools(self, tools):
+            return self
+
+        def invoke(self, messages):
+            trace = next(message.content for message in messages
+                         if isinstance(message, SystemMessage)
+                         and message.content.startswith('Rastreio cronológico'))
+            assert 'Pixel art' in trace and 'Vetor' in trace
+            return AIMessage(content='', tool_calls=[{'id':'conflict','name':'ask_user',
+                'args':{'question':'Você escolheu Pixel art antes e Vetor agora. Qual deve prevalecer?',
+                        'options':['Pixel art','Vetor']},'type':'tool_call'}])
+
+    with patch('agente.ChatOpenAI', FakeModel):
+        result = build_agent(root, 'http://localhost:8080/v1', 'qwen', 0, 128).invoke(
+            {'messages': [HumanMessage(content='Continue o projeto')]},
+            config={'recursion_limit': 8})
+    assert 'Qual deve prevalecer?' in result['messages'][-1].content
+
+
+def test_question_cache_selects_exact_branch(tmp_path):
+    """Persiste perguntas condicionais e recupera apenas a alternativa selecionada."""
+    root = create_session(tmp_path)
+    cache_followups(root, 'Qual formato?', [
+        {'answer':'CSV', 'question':'Deseja cabeçalho?', 'options':['Sim','Não']},
+        {'answer':'JSON', 'question':'Deseja indentação?', 'options':['2','4']},
+    ])
+    assert len(question_cache(root)) == 2
+    assert cached_followup(root, 'Qual formato?', 'csv')['question'] == 'Deseja cabeçalho?'
+    assert cached_followup(root, 'Qual formato?', 'XML') is None
+
+
+def test_prefetched_question_is_used_after_answer(tmp_path):
+    """Evita nova inferência principal ao encontrar a próxima pergunta no cache."""
+    root = create_session(tmp_path)
+    cache_followups(root, 'Qual formato?', [
+        {'answer':'CSV', 'question':'Deseja cabeçalho?', 'options':['Sim','Não']},
+    ])
+
+    class FailIfMainModelRuns:
+        def __init__(self, **kw):
+            pass
+
+        def bind_tools(self, tools):
+            return self
+
+        def invoke(self, messages):
+            # O handoff pode tentar pré-calcular o nível seguinte; a inferência principal não pode.
+            assert any(isinstance(message, SystemMessage) and 'pré-calcula' in message.content
+                       for message in messages)
+            return AIMessage(content='{"followups": []}')
+
+    answer = HumanMessage(content='Resposta registrada', additional_kwargs={
+        'answer_to':'Qual formato?', 'decision_answer':'CSV', 'display_content':'CSV'})
+    with patch('agente.ChatOpenAI', FailIfMainModelRuns):
+        result = build_agent(root, 'http://localhost:8080/v1', 'qwen', 0, 128).invoke(
+            {'messages': [answer]}, config={'recursion_limit': 8})
+    assert 'Deseja cabeçalho?' in result['messages'][-1].content
+
+
+def test_plain_model_question_falls_back_to_ask_user(tmp_path):
+    """Converte pergunta textual de modelo local em handoff interativo."""
+    root = create_session(tmp_path)
+
+    class FakeModel:
+        def __init__(self, **kw):
+            pass
+
+        def bind_tools(self, tools):
+            return self
+
+        def invoke(self, messages):
+            return AIMessage(content='''Qual formato você prefere?
+
+- CSV
+- JSON
+- Markdown
+
+Aguardo sua resposta para continuar.''')
+
+    assert _plain_question('Resposta conclusiva.') is None
+    assert _plain_options('- CSV\n- JSON') == ['CSV', 'JSON']
+    with patch('agente.ChatOpenAI', FakeModel):
+        result = build_agent(root, 'http://localhost:8080/v1', 'qwen', 0, 128).invoke(
+            {'messages': [HumanMessage(content='Prepare um relatório')]},
+            config={'recursion_limit': 8})
+    question = next(message for message in result['messages']
+                    if isinstance(message, ToolMessage) and message.name == 'ask_user')
+    payload = json.loads(question.content)
+    assert 'Qual formato você prefere?' in payload['question']
+    assert payload['options'] == ['CSV', 'JSON', 'Markdown']
+    assert 'Qual formato você prefere?' in result['messages'][-1].content
+    assert 'Escolha uma alternativa' not in result['messages'][-1].content
 
 
 def test_names_survive_reload_and_legacy_migration(tmp_path):
@@ -311,6 +560,23 @@ def test_names_survive_reload_and_legacy_migration(tmp_path):
     (old / 'conversation.json').write_text(json.dumps([
         {'type':'human','data':{'content':'Primeira pergunta sobre órbitas'}}]))
     assert session_meta(old)['title'] == 'Primeira pergunta sobre órbitas'
+
+
+def test_llm_settings_are_persisted_per_conversation(tmp_path):
+    """Restaura os parâmetros do modelo sem misturá-los entre conversas."""
+    first = create_session(tmp_path)
+    second = create_session(tmp_path)
+    defaults = {'base_url':'http://default/v1', 'model':'qwen',
+                'temperature':0.2, 'max_tokens':4096}
+    assert session_settings(first, defaults) == defaults
+    save_session_settings(first, {'base_url':'http://local/v1', 'model':'qwen-coder',
+                                  'temperature':0.4, 'max_tokens':8192,
+                                  'api_key':'não deve ser salvo'})
+    restored = session_settings(first, defaults)
+    assert restored == {'base_url':'http://local/v1', 'model':'qwen-coder',
+                        'temperature':0.4, 'max_tokens':8192}
+    assert session_settings(second, defaults) == defaults
+    assert 'api_key' not in json.loads((first / 'session.json').read_text())['llm_settings']
 
 
 def test_actual_runner_success_and_timeout(tmp_path):
@@ -380,7 +646,7 @@ def test_ui_question_options_resume_next_turn(tmp_path, monkeypatch):
             return self
         def invoke(self, messages):
             """Pergunta o formato ou confirma a escolha recebida."""
-            if messages[-1].content == 'CSV':
+            if 'Resposta à pergunta' in messages[-1].content and 'CSV' in messages[-1].content:
                 return AIMessage(content='Formato escolhido: CSV.')
             return AIMessage(content='', tool_calls=[{'id':'question_1','name':'ask_user',
                 'args':{'question':'Qual formato deseja?', 'options':['CSV','JSON']},'type':'tool_call'}])
@@ -388,11 +654,82 @@ def test_ui_question_options_resume_next_turn(tmp_path, monkeypatch):
         app = AppTest.from_file(str(Path(__file__).parent / 'app.py')).run(timeout=30)
         app.chat_input[0].set_value('Preciso de um arquivo').run(timeout=30)
         assert not app.exception
-        assert any('Qual formato deseja?' in m.value for m in app.markdown)
-        next(b for b in app.button if b.label == 'CSV').click()
-        app.run(timeout=30)
+        assert sum('Qual formato deseja?' in m.value for m in app.markdown) == 1
+        assert not any(m.value == 'Sua resposta' for m in app.markdown)
+        next(r for r in app.radio if r.label == 'Escolha uma alternativa').set_value('CSV').run(timeout=30)
+        next(b for b in app.button if b.label == 'Enviar resposta').click().run(timeout=30)
         assert not app.exception
         assert any('Formato escolhido: CSV.' in m.value for m in app.markdown)
+
+
+def test_ui_question_other_opens_text_and_resumes(tmp_path, monkeypatch):
+    """Exibe entrada livre somente após selecionar Outros e envia seu conteúdo."""
+    from streamlit.testing.v1 import AppTest
+    monkeypatch.setenv('HARNESS_DATA_DIR', str(tmp_path))
+
+    class FakeModel:
+        """Pergunta com opções e confirma uma resposta personalizada."""
+
+        def __init__(self, **kw):
+            pass
+
+        def bind_tools(self, tools):
+            return self
+
+        def invoke(self, messages):
+            if 'Resposta à pergunta' in messages[-1].content and 'Parquet' in messages[-1].content:
+                return AIMessage(content='Formato personalizado: Parquet.')
+            return AIMessage(content='', tool_calls=[{'id':'question_other','name':'ask_user',
+                'args':{'question':'Qual formato deseja?', 'options':['CSV','JSON']},'type':'tool_call'}])
+
+    with patch('agente.ChatOpenAI', FakeModel):
+        app = AppTest.from_file(str(Path(__file__).parent / 'app.py')).run(timeout=30)
+        app.chat_input[0].set_value('Preciso de outro formato').run(timeout=30)
+        assert not any(t.label == 'Digite sua resposta' for t in app.text_input)
+        next(r for r in app.radio if r.label == 'Escolha uma alternativa').set_value('Outros').run(timeout=30)
+        custom = next(t for t in app.text_input if t.label == 'Digite sua resposta')
+        custom.set_value('Parquet').run(timeout=30)
+        next(b for b in app.button if b.label == 'Enviar resposta').click().run(timeout=30)
+        assert not app.exception
+        assert any('Formato personalizado: Parquet.' in m.value for m in app.markdown)
+
+
+def test_ui_question_answer_continues_with_next_question(tmp_path, monkeypatch):
+    """Mantém o objetivo original e avança automaticamente por perguntas sequenciais."""
+    from streamlit.testing.v1 import AppTest
+    monkeypatch.setenv('HARNESS_DATA_DIR', str(tmp_path))
+
+    class FakeModel:
+        def __init__(self, **kw):
+            pass
+
+        def bind_tools(self, tools):
+            return self
+
+        def invoke(self, messages):
+            last = messages[-1].content
+            if 'Resposta à pergunta' in last and 'CSV' in last:
+                return AIMessage(content='', tool_calls=[{'id':'question_2','name':'ask_user',
+                    'args':{'question':'Deseja cabeçalho?', 'options':['Sim','Não']},'type':'tool_call'}])
+            if 'Resposta à pergunta' in last and 'Sim' in last:
+                return AIMessage(content='Configuração concluída e fluxo retomado.')
+            return AIMessage(content='', tool_calls=[{'id':'question_1','name':'ask_user',
+                'args':{'question':'Qual formato?', 'options':['CSV','JSON']},'type':'tool_call'}])
+
+    with patch('agente.ChatOpenAI', FakeModel):
+        app = AppTest.from_file(str(Path(__file__).parent / 'app.py')).run(timeout=30)
+        app.chat_input[0].set_value('Configure a exportação').run(timeout=30)
+        next(r for r in app.radio if r.label == 'Escolha uma alternativa').set_value('CSV').run(timeout=30)
+        next(b for b in app.button if b.label == 'Enviar resposta').click().run(timeout=30)
+        assert any('Deseja cabeçalho?' in m.value for m in app.markdown)
+        next(r for r in app.radio if r.label == 'Escolha uma alternativa').set_value('Sim').run(timeout=30)
+        next(b for b in app.button if b.label == 'Enviar resposta').click().run(timeout=30)
+        assert not app.exception
+        assert any('Configuração concluída e fluxo retomado.' in m.value for m in app.markdown)
+        # A interface mostra respostas curtas, sem expor a instrução interna de continuação.
+        assert any(m.value == 'CSV' for m in app.markdown)
+        root = Path(app.session_state['root'])
+        assert [entry['answer'] for entry in decision_log(root)] == ['CSV', 'Sim']
 
 
 def test_log_limit_and_failed_collection_cleanup(tmp_path, monkeypatch):

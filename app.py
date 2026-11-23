@@ -12,13 +12,16 @@ from zipfile import ZipFile, ZIP_DEFLATED
 import psutil
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, messages_from_dict
-from agente import build_agent, complete_pending_calls
+from agente import _clean_option, build_agent, complete_pending_calls
 from ingestao import build_ingestion
 from jobs import JobStore, TERMINAL, data_dir
 from security import SecurityStore, assess_file, format_alerts, safe_to_display
 from storage import (artifacts, create_session, safe_name, save_messages,
-                     session_meta, rename_session)
+                     decision_log, question_cycles, record_decision,
+                     save_session_settings, session_meta, session_settings,
+                     rename_session)
 
 st.set_page_config(page_title='Qwen · Homelab', page_icon='🧪', layout='wide')
 BASE = data_dir()
@@ -26,6 +29,48 @@ BASE.mkdir(parents=True, exist_ok=True)
 UPLOAD_TYPES = ['pdf','csv','json','txt','md','py','sql','yaml','yml','toml']
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_UPLOAD_FILES = 10
+
+
+def scroll_to_latest():
+    """Solicita ao navegador rolagem suave até o conteúdo mais recente da página."""
+    components.html('''
+<script>
+const scrollLatest = () => {
+  const doc = window.parent.document;
+  const frame = window.frameElement;
+
+  // O iframe deste componente é o marcador mais confiável do fim da conversa.
+  if (frame) frame.scrollIntoView({behavior: 'smooth', block: 'end'});
+
+  // Streamlit mudou o elemento rolável entre versões; cubra os seletores conhecidos.
+  const candidates = [
+    doc.querySelector('[data-testid="stMain"]'),
+    doc.querySelector('section.main'),
+    doc.querySelector('[data-testid="stAppViewContainer"]')
+  ].filter(Boolean);
+
+  // Inclua qualquer ancestral realmente rolável do marcador.
+  let node = frame && frame.parentElement;
+  while (node) {
+    const style = window.parent.getComputedStyle(node);
+    if (node.scrollHeight > node.clientHeight && /(auto|scroll)/.test(style.overflowY)) {
+      candidates.push(node);
+    }
+    node = node.parentElement;
+  }
+
+  [...new Set(candidates)].forEach(element => {
+    element.scrollTo({top: element.scrollHeight, behavior: 'smooth'});
+  });
+  window.parent.scrollTo({top: doc.documentElement.scrollHeight, behavior: 'smooth'});
+};
+
+// A primeira passagem cobre o rerun; as seguintes cobrem fontes, cartões e expansores
+// que alteram a altura logo depois que o componente entra no DOM.
+requestAnimationFrame(scrollLatest);
+[100, 300, 700].forEach(delay => setTimeout(scrollLatest, delay));
+</script>
+''', height=0)
 
 
 @st.dialog('Adicionar arquivos à conversa', width='large')
@@ -68,6 +113,13 @@ if 'root' not in st.session_state:
 root = Path(st.session_state.root)
 (root / 'work').mkdir(exist_ok=True)
 meta = session_meta(root)
+llm_defaults = {
+    'base_url': os.environ.get('LLAMA_BASE_URL', 'http://127.0.0.1:8080/v1'),
+    'model': os.environ.get('LLAMA_MODEL', 'qwen'),
+    'max_tokens': 4096,
+    'temperature': 0.2,
+}
+saved_llm = session_settings(root, llm_defaults)
 store = JobStore(BASE)
 
 with st.sidebar:
@@ -111,10 +163,20 @@ with st.sidebar:
             except ValueError as exc:
                 st.error(str(exc))
     with st.expander('Conexão e geração'):
-        base_url = st.text_input('API do llama.cpp', os.environ.get('LLAMA_BASE_URL', 'http://127.0.0.1:8080/v1'))
-        model = st.text_input('Modelo / alias', os.environ.get('LLAMA_MODEL', 'qwen'))
-        max_tokens = st.number_input('Máximo de tokens por resposta', min_value=128, max_value=16384, value=4096, step=128)
-        temperature = st.slider('Temperatura', 0.0, 1.0, 0.2, 0.1)
+        base_url = st.text_input('API do llama.cpp', saved_llm['base_url'],
+                                 key='base_url_' + root.name)
+        model = st.text_input('Modelo / alias', saved_llm['model'],
+                              key='model_' + root.name)
+        max_tokens = st.number_input('Máximo de tokens por resposta', min_value=128,
+                                     max_value=16384, value=int(saved_llm['max_tokens']), step=128,
+                                     key='max_tokens_' + root.name)
+        temperature = st.slider('Temperatura', 0.0, 1.0, float(saved_llm['temperature']), 0.1,
+                                key='temperature_' + root.name)
+        save_session_settings(root, {
+            'base_url': base_url.strip(), 'model': model.strip(),
+            'max_tokens': int(max_tokens), 'temperature': float(temperature),
+        })
+        st.caption('Estes parâmetros são salvos automaticamente nesta conversa.')
         if st.button('Testar conexão'):
             try:
                 response = requests.get(base_url.rstrip('/') + '/models', timeout=10)
@@ -332,7 +394,7 @@ with chat_tab:
     for message in st.session_state.messages:
         if isinstance(message, HumanMessage):
             with st.chat_message('user'):
-                st.markdown(message.content)
+                st.markdown(message.additional_kwargs.get('display_content', message.content))
         elif isinstance(message, AIMessage):
             if message.content:
                 with st.chat_message('assistant'):
@@ -357,7 +419,7 @@ with chat_tab:
                     st.json(visible)
                 else:
                     st.code(str(message.content), language='json')
-    # Opções de ask_user podem ser respondidas com um clique ou por texto livre.
+    # Perguntas de ask_user recebem um cartão próprio com alternativa livre condicional.
     for previous in reversed(st.session_state.messages):
         if isinstance(previous, HumanMessage):
             break
@@ -385,13 +447,55 @@ with chat_tab:
         if isinstance(previous, ToolMessage) and previous.name == 'ask_user':
             try:
                 question = json.loads(previous.content)
-                for i, option in enumerate(question.get('options', [])):
-                    if st.button(option, key=f'answer_{previous.tool_call_id}_{i}'):
-                        st.session_state.pending_prompt = option
+                options = [_clean_option(option) for option in question.get('options', [])
+                           if isinstance(option, str) and option.strip()][:4]
+                options = [option for option in options
+                           if option and not option.casefold().startswith(('outro', 'outra'))]
+                choices = [*options, 'Outros']
+                key = previous.tool_call_id
+                with st.container(border=True):
+                    selected = st.radio('Escolha uma alternativa', choices, index=None,
+                                        key='question_choice_' + key,
+                                        label_visibility='collapsed')
+                    custom = ''
+                    if selected == 'Outros':
+                        custom = st.text_input('Digite sua resposta', max_chars=2000,
+                                               key='question_other_' + key)
+                    answer = custom.strip() if selected == 'Outros' else selected
+                    if st.button('Enviar resposta', type='primary', disabled=not answer,
+                                 key='question_submit_' + key):
+                        decision = record_decision(root, question['question'], answer, options)
+                        st.session_state.pending_prompt = {
+                            'content': (
+                                f'Resposta à pergunta "{question["question"]}": {answer}\n\n'
+                                f'Essa escolha foi registrada como {decision["id"]}. '
+                                'Retome agora o pedido original automaticamente. Se ainda faltar '
+                                'informação, faça apenas a próxima pergunta usando ask_user. Caso '
+                                'contrário, prossiga com o trabalho e as ferramentas necessárias.'
+                            ),
+                            'display': answer,
+                            'answer_to': question['question'],
+                            'decision_answer': answer,
+                        }
                         st.rerun()
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, KeyError):
                 pass
             break
+    choices = decision_log(root)
+    if choices:
+        with st.expander(f'Rastreio de escolhas ({len(choices)})'):
+            for choice in reversed(choices):
+                st.markdown(f'**{choice["sequence"]}. {choice["answer"]}**  ')
+                st.caption(choice['question'])
+    cycles = question_cycles(root)
+    if cycles:
+        current = cycles[-1]
+        label = 'em andamento' if current['status'] == 'active' else 'concluído'
+        with st.expander(f'Ciclo de perguntas — {label}'):
+            st.markdown(current['goal'])
+            st.caption(f"{current['questions_asked']} pergunta(s) realizada(s)")
+            for criterion in current['definition_of_done']:
+                st.markdown('- ' + criterion)
     notice = st.session_state.pop('upload_notice', None)
     if notice:
         for item in notice:
@@ -409,14 +513,28 @@ with chat_tab:
     with message_col:
         prompt = st.chat_input('O que vamos investigar?')
     pending = st.session_state.pop('pending_prompt', None)
-    prompt = prompt or pending
-    if prompt:
+    submitted = prompt if prompt else pending
+    if submitted:
+        if isinstance(submitted, dict):
+            prompt_content = submitted['content']
+            prompt_display = submitted.get('display', prompt_content)
+            prompt_metadata = {key: submitted[key] for key in ('answer_to', 'decision_answer')
+                               if key in submitted}
+        else:
+            prompt_content = prompt_display = submitted
+            prompt_metadata = {}
         if meta['title'] == 'Nova conversa':
-            rename_session(root, ' '.join(prompt.split())[:72])
-        st.session_state.messages.append(HumanMessage(content=prompt))
+            rename_session(root, ' '.join(prompt_display.split())[:72])
+        st.session_state.messages.append(HumanMessage(
+            content=prompt_content,
+            additional_kwargs={
+                **prompt_metadata,
+                **({'display_content': prompt_display} if prompt_display != prompt_content else {}),
+            }))
         save_messages(root, st.session_state.messages)
         with st.chat_message('user'):
-            st.markdown(prompt)
+            st.markdown(prompt_display)
+        scroll_to_latest()
         try:
             graph = build_agent(root, base_url.strip(), model.strip(), temperature, int(max_tokens))
             with st.status('Consultando Qwen…', expanded=True) as status:
@@ -426,6 +544,7 @@ with chat_tab:
                         new_messages = delta.get('messages', [])
                         st.session_state.messages.extend(new_messages)
                         save_messages(root, st.session_state.messages)
+                        scroll_to_latest()
                         for message in new_messages:
                             if isinstance(message, AIMessage) and message.tool_calls:
                                 st.write('Executando ferramenta: ' + ', '.join(c['name'] for c in message.tool_calls))
@@ -437,6 +556,7 @@ with chat_tab:
             st.session_state.messages.append(AIMessage(content=f'Não foi possível concluir: {exc}'))
             save_messages(root, st.session_state.messages)
         st.rerun()
+    scroll_to_latest()
 
 with files_tab:
     st.subheader('Arquivos para baixar')
