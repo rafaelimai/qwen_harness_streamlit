@@ -1,6 +1,5 @@
 """Worker Linux independente da UI. Um job por vez; Docker obrigatório, sem fallback host."""
 import argparse
-import fcntl
 from hashlib import sha256
 import io
 import json
@@ -20,9 +19,9 @@ IMAGE = os.environ.get('HARNESS_RUNNER_IMAGE', 'qwen-harness-runner:1')
 LOG_LIMIT = 4 * 1024 * 1024  # por fluxo; excedentes encerram o job
 
 
-def container_name(job_id):
-    """Deriva um nome de contêiner Docker estável a partir da tarefa."""
-    return 'qh-' + job_id.replace('_', '-')
+def container_name(row):
+    """Deriva um nome Docker isolado para cada tentativa de uma tarefa."""
+    return 'qh-' + row['id'].replace('_', '-') + '-' + row['active_token'][:12]
 
 
 def extract_outputs(stream, destination):
@@ -71,7 +70,7 @@ class DockerEngine:
         """Cria um contêiner restrito para o snapshot e os argumentos da tarefa."""
         request = json.loads(row['payload'])
         return self.command([
-            'create', '--name', container_name(row['id']), '--label', 'qwen-harness=true',
+            'create', '--name', container_name(row), '--label', 'qwen-harness=true',
             '--network', 'none', '--read-only', '--user', '1000:1000', '--init',
             '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges=true',
             '--cpus', '2', '--memory', '2g', '--memory-swap', '2g', '--pids-limit', '64',
@@ -86,13 +85,13 @@ class DockerEngine:
 
     def start(self, row):
         """Inicia o contêiner anexando seus fluxos de saída ao worker."""
-        return subprocess.Popen(['docker', 'start', '--attach', container_name(row['id'])],
+        return subprocess.Popen(['docker', 'start', '--attach', container_name(row)],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
 
     def result(self, row):
         """Lê e valida o marcador de conclusão gravado dentro do contêiner."""
         # Python do contêiner lê no máximo 4096 bytes, mesmo se um script adulterar o marcador.
-        p = self.command(['exec', container_name(row['id']), 'python', '-I', '-c',
+        p = self.command(['exec', container_name(row), 'python', '-I', '-c',
                           "from pathlib import Path; p=Path('/tmp/harness-result.json'); print(p.open().read(4096) if p.exists() else '')"],
                          timeout=10, check=False)
         if p.returncode or not p.stdout.strip():
@@ -105,7 +104,7 @@ class DockerEngine:
 
     def export(self, row, destination):
         """Copia e valida os artefatos produzidos no diretório de destino."""
-        process = subprocess.Popen(['docker','cp',container_name(row['id']) + ':/work/outputs/.','-'],
+        process = subprocess.Popen(['docker','cp',container_name(row) + ':/work/outputs/.','-'],
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         # Prazo também para streams tar incompletos ou Docker sem responder.
         timer = threading.Timer(30, process.kill)
@@ -124,7 +123,7 @@ class DockerEngine:
 
     def remove(self, row):
         """Remove forçadamente o contêiner associado à tarefa."""
-        result = self.command(['rm', '--force', container_name(row['id'])], check=False)
+        result = self.command(['rm', '--force', container_name(row)], check=False)
         if result.returncode and 'No such container' not in result.stderr:
             raise RuntimeError(result.stderr.strip()[:2000] or 'Docker não removeu o contêiner.')
 
@@ -145,10 +144,14 @@ def collect_log(pipe, target, overflow):
 
 def run_job(store, row, engine):
     """Executa uma tarefa reservada e publica seu estado, logs e artefatos."""
+    token = row['active_token']
     root = store.base / row['session_id']
     jobdir = root / 'jobs' / row['id']
-    destination = root / 'outputs' / 'jobs' / row['id']
-    temp = jobdir / 'collected'
+    attempt = jobdir / 'attempts' / token
+    logs = attempt / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
+    destination = root / 'outputs' / 'jobs' / row['id'] / token
+    temp = attempt / 'collected'
     process = None
     threads = []
     overflow = threading.Event()
@@ -164,17 +167,21 @@ def run_job(store, row, engine):
                 if sha256(frozen_script.read_bytes()).hexdigest() != security['script_sha256']:
                     raise ValueError('Hash do script diverge da decisão de segurança.')
             engine.create(row, jobdir / 'snapshot')
-            store.update(row['id'], status='running')
+            if not store.update_attempt(row['id'], token, status='running'):
+                return
             process = engine.start(row)
             for name in ('stdout', 'stderr'):
                 thread = threading.Thread(target=collect_log,
-                    args=(getattr(process,name), jobdir / 'logs' / f'{name}.log', overflow), daemon=True)
+                    args=(getattr(process,name), logs / f'{name}.log', overflow), daemon=True)
                 thread.start()
                 threads.append(thread)
             start = time.monotonic()
             deadline = json.loads(row['payload'])['timeout'] + 10  # margem para inicializar o runner
             while True:
                 store.heartbeat()
+                if not store.token_is_active(row['id'], token):
+                    # Outra tentativa tomou posse; o finally encerra somente este contêiner.
+                    break
                 if store.get(root, row['id'])['cancel_requested']:
                     status = 'cancelled'
                     break
@@ -223,52 +230,45 @@ def run_job(store, row, engine):
         if overflow.is_set() and status not in ('cancelled', 'interrupted'):
             status, error = 'failed', 'Limite de 4 MiB por fluxo de log excedido.'
         # Um cancelamento solicitado durante a coleta ainda precisa ser refletido no status.
-        if store.get(root, row['id'])['cancel_requested'] and status != 'interrupted':
+        if store.token_is_active(row['id'], token) and store.get(root, row['id'])['cancel_requested'] and status != 'interrupted':
             status = 'cancelled'
-        store.update(row['id'], status=status, exit_code=code, error=error,
-                     finished_at=now(), artifacts=json.dumps(published))
+        accepted = store.update_attempt(row['id'], token, status=status, exit_code=code, error=error,
+                                        finished_at=now(), artifacts=json.dumps(published))
+        if not accepted and destination.exists():
+            shutil.rmtree(destination, ignore_errors=True)
 
 
 def recover(store, engine):
-    """Não reexecuta tarefas ambíguas após queda do worker."""
-    for row in store.unfinished():
-        engine.remove(row)
-        store.update(row['id'], status='interrupted', finished_at=now(),
-                     error='Worker reiniciado. Tarefa anterior interrompida; não foi reexecutada.')
+    """Mantém tentativas existentes; claims futuros retomam apenas leases vencidos."""
+    return 0
 
 
 def main():
-    """Inicia o worker exclusivo e consome tarefas da fila continuamente."""
+    """Inicia um worker e consome tarefas da fila continuamente."""
     parser = argparse.ArgumentParser()
     parser.add_argument('--once', action='store_true', help='Processa no máximo um job e encerra.')
     args = parser.parse_args()
     store = JobStore()
-    # Lock exclusivo no Linux: impede dois workers de rodarem jobs concorrentes por acidente.
-    with (store.base / 'worker.lock').open('w') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SystemExit('Já existe um worker ativo neste diretório de dados.')
-        engine = DockerEngine()
-        try:
-            engine.preflight()
-        except Exception as exc:
-            raise SystemExit(f'Worker não iniciou: {exc}\nExecute bash preparar_executor.sh e confira docker info.')
-        recover(store, engine)
-        print('Worker ativo. Uma tarefa por vez. Ctrl+C encerra o worker.', flush=True)
-        try:
-            while True:
-                store.heartbeat()
-                row = store.claim()
-                if row:
-                    print(f"Executando {row['id']}", flush=True)
-                    run_job(store, row, engine)
-                if args.once:
-                    return
-                if not row:
-                    time.sleep(1)
-        except KeyboardInterrupt:
-            print('Worker encerrado.', flush=True)
+    engine = DockerEngine()
+    try:
+        engine.preflight()
+    except Exception as exc:
+        raise SystemExit(f'Worker não iniciou: {exc}\nExecute bash preparar_executor.sh e confira docker info.')
+    recover(store, engine)
+    print('Worker ativo. Uma tarefa por vez neste processo; a fila aceita múltiplos workers.', flush=True)
+    try:
+        while True:
+            store.heartbeat()
+            row = store.claim()
+            if row:
+                print(f"Executando {row['id']} tentativa {row['attempt_number']}", flush=True)
+                run_job(store, row, engine)
+            if args.once:
+                return
+            if not row:
+                time.sleep(1)
+    except KeyboardInterrupt:
+        print('Worker encerrado.', flush=True)
 
 
 if __name__ == '__main__':
