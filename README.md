@@ -19,6 +19,9 @@ O projeto combina Streamlit, LangGraph, SQLite e Docker em uma aplicação volta
 - Conversão de PDFs e páginas HTML para Markdown.
 - Ferramentas para leitura, busca e gravação de texto e código.
 - Fila persistente de execuções em SQLite.
+- Contratos de validação congelados antes de cada tentativa.
+- Verificação automática separada da aceitação humana.
+- Log de eventos append-only com idempotência e controle de concorrência.
 - Execução Python em contêineres Docker sem rede.
 - Limites de CPU, memória, processos, tempo, logs e artefatos.
 - Acompanhamento de tarefas sem manter o navegador aberto.
@@ -37,10 +40,13 @@ flowchart LR
     Q --> W[Worker]
     W --> D[Contêiner Docker isolado]
     D --> A[Artefatos e logs]
+    W --> V[(Validação SQLite)]
+    V --> P[Projeções e decisões]
+    P --> UI
     A --> UI
 ```
 
-O Streamlit cuida da interface e da persistência das conversas. O agente usa ferramentas com caminhos limitados ao workspace da conversa. Scripts Python são registrados na fila e executados por um worker separado dentro do Docker.
+O Streamlit cuida da interface e da persistência das conversas. O agente usa ferramentas com caminhos limitados ao workspace da conversa. Scripts Python são registrados na fila e executados por um worker separado dentro do Docker. O worker registra tentativas, manifestos e evidências em um protocolo de validação independente do estado operacional da fila.
 
 ## Requisitos
 
@@ -164,6 +170,31 @@ Um pedido completo pode ser feito diretamente no chat:
 
 O agente grava o script e enfileira a execução. A aba **Tarefas** exibe o estado, os logs e os artefatos. Ao final, use **Analisar resultado** para pedir ao modelo uma avaliação da execução.
 
+### Validação dos resultados
+
+Cada job recebe um contrato congelado antes da primeira tentativa. A implementação inicial possui dois critérios obrigatórios:
+
+1. a execução terminou com sucesso, verificado automaticamente pelo estado do worker;
+2. o resultado entregue foi aceito pelo usuário, decidido na aba **Tarefas**.
+
+Por isso, uma execução bem-sucedida não é aprovada automaticamente. Ela normalmente termina com:
+
+```text
+acceptance_status = PENDING
+verification_status = PARTIALLY_VERIFIED
+approved = false
+```
+
+Na aba **Tarefas**, cada critério apresenta seu estado de aceitação, sua verificação independente e o efeito de eventual decisão humana. Os controles disponíveis são:
+
+- **Aceitar:** define o critério como `ACCEPTED`;
+- **Rejeitar:** define o critério como `REJECTED`;
+- **Usar evidência:** remove a intervenção efetiva e volta ao estado derivado da evidência.
+
+A interface também informa `approval_basis` (`AUTOMATED_ONLY`, `MIXED`, `HUMAN_ONLY` ou `NONE`) e `human_review_status`. Uma decisão humana pode aprovar um critério refutado, mas não altera nem apaga a evidência original.
+
+O protocolo completo, incluindo identidade, rodadas, reducers, invariantes e pontos deliberadamente adiados, está em [`contrato_validacao_maquina_estados_harness.md`](contrato_validacao_maquina_estados_harness.md).
+
 Cada conversa usa três diretórios principais:
 
 ```text
@@ -248,7 +279,18 @@ Use o mesmo `HARNESS_DATA_DIR` e `HARNESS_RUNNER_IMAGE` na interface e no worker
 
 ## Persistência
 
-As conversas ficam em `data/`, junto com o banco `jobs.sqlite3`. `conversation.json` preserva mensagens, chamadas de ferramentas e seus resultados; `session.json` guarda título e os parâmetros de geração usados por aquela conversa (`base_url`, modelo/alias, temperatura e máximo de tokens). Ao reabrir uma conversa, a interface restaura o histórico e esses parâmetros automaticamente. Credenciais não são persistidas.
+As conversas ficam em `data/`, junto com os bancos `jobs.sqlite3` e `validation.sqlite3`. `conversation.json` preserva mensagens, chamadas de ferramentas e seus resultados; `session.json` guarda título e os parâmetros de geração usados por aquela conversa (`base_url`, modelo/alias, temperatura e máximo de tokens). Ao reabrir uma conversa, a interface restaura o histórico e esses parâmetros automaticamente. Credenciais não são persistidas.
+
+O banco de validação mantém:
+
+- contratos congelados antes das tentativas;
+- eventos append-only com posição global e revisão por stream;
+- manifestos de resultado e digests SHA-256 dos artefatos;
+- avaliações, rodadas e revisões projetadas;
+- decisões humanas vinculadas à rodada vigente;
+- estados agregados de aceitação e verificação.
+
+Repetições usam chaves idempotentes. Atualizações concorrentes usam compare-and-swap sobre a revisão do stream; payload diferente com a mesma chave é tratado como conflito.
 
 Decisões, ciclos e perguntas pré-calculadas ficam em arquivos próprios na mesma pasta da conversa. O estado interno do servidor de inferência — como KV cache, seed e flags usadas para iniciar o llama.cpp — não é serializado; portanto, retomar preserva o contexto lógico e a configuração da interface, mas não garante reprodução bit a bit de uma geração anterior.
 
@@ -288,6 +330,8 @@ Execute a suíte local:
 
 Os testes cobrem conversão de documentos, isolamento de caminhos, persistência SQLite, idempotência, ciclo de ferramentas, interface, limites de artefatos e o lifecycle do worker com um backend simulado. Também exercitam reivindicação e retomada concorrentes com conexões SQLite distintas, expiração sem substituição e fencing do token antigo.
 
+O núcleo de validação possui testes específicos para políticas `ALL`, `ANY` e `QUORUM`, separação entre falha operacional e observação, overrides humanos, base causal da aprovação, revisões append-only, compare-and-swap concorrente e integração completa entre fila, worker e projeção persistida.
+
 Para executar a integração com Docker real:
 
 ```bash
@@ -306,6 +350,7 @@ Esse teste verifica sucesso, falha Python, timeout, cancelamento, snapshot somen
 ├── ingestao.py               conversão de PDF e HTML
 ├── storage.py                workspaces e histórico das conversas
 ├── jobs.py                   fila SQLite e snapshots
+├── validation.py             reducers, eventos e projeções de validação
 ├── worker.py                 execução e lifecycle dos contêineres
 ├── sandbox/
 │   ├── Dockerfile            imagem do executor
@@ -325,6 +370,9 @@ Esse teste verifica sucesso, falha Python, timeout, cancelamento, snapshot somen
 - Não há autenticação nem autorização por usuário.
 - O histórico é persistido, mas o estado interno de um nó LangGraph não possui checkpoint durável.
 - A conclusão de uma tarefa não retoma o agente automaticamente.
+- Os contratos criados automaticamente para jobs ainda usam dois critérios fixos; geração de critérios específicos a partir do pedido permanece futura.
+- O modelo de autoridade ainda considera um único usuário local; papéis e permissões granulares não foram implementados.
+- Validadores gerados dinamicamente, isolamento próprio para validadores e evidências externas autoritativas ainda não foram implementados.
 - PDFs sem camada de texto precisam de OCR externo.
 - A busca em arquivos é textual, sem RAG ou índice semântico.
 - Logs e snapshots antigos não possuem limpeza automática.

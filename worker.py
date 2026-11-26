@@ -234,6 +234,16 @@ def run_job(store, row, engine):
             status = 'cancelled'
         accepted = store.update_attempt(row['id'], token, status=status, exit_code=code, error=error,
                                         finished_at=now(), artifacts=json.dumps(published))
+        if accepted:
+            manifest_artifacts = []
+            for relative in published:
+                artifact = root / relative
+                manifest_artifacts.append({
+                    'uri': relative,
+                    'digest': 'sha256:' + sha256(artifact.read_bytes()).hexdigest(),
+                    'size_bytes': artifact.stat().st_size,
+                })
+            store.validation.record_job_result(row['id'], token, status, manifest_artifacts)
         if not accepted and destination.exists():
             shutil.rmtree(destination, ignore_errors=True)
 
