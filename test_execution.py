@@ -192,6 +192,13 @@ def test_worker_result_and_artifact(tmp_path, result, status):
     assert final['stdout_tail'] == 'Execution OK\n'
     assert (root / final['artifacts'][0]).is_file()
     assert engine.removed == 1
+    projection = final['validation']['projection']
+    if status == 'succeeded':
+        assert projection['acceptance_status'] == 'PENDING'
+        assert projection['verification_status'] == 'PARTIALLY_VERIFIED'
+    else:
+        assert projection['acceptance_status'] == 'REJECTED'
+        assert projection['verification_status'] == 'REFUTED'
 
 
 def test_worker_cancellation(tmp_path):

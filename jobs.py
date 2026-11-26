@@ -11,6 +11,7 @@ import stat
 from uuid import uuid4
 
 from storage import inside
+from validation import HarnessValidation
 
 TERMINAL = {'succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'}
 MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
@@ -120,6 +121,7 @@ class JobStore:
             # Execuções de versões anteriores não possuem lease e não poderiam ser retomadas.
             db.execute("UPDATE jobs SET lease_expires_at=? WHERE status IN ('starting','running') AND lease_expires_at IS NULL",
                        (now(),))
+        self.validation = HarnessValidation(self.base / 'validation.sqlite3')
 
     @contextmanager
     def db(self):
@@ -173,6 +175,7 @@ class JobStore:
             if existing:
                 if existing['payload'] != payload:
                     raise ValueError('Chave de execução já usada com argumentos diferentes.')
+                self.validation.bootstrap_job(existing['id'], session_id)
                 return self.describe(dict(existing))
             job_id = 'job_' + uuid4().hex
             directory = root / 'jobs' / job_id
@@ -190,6 +193,7 @@ class JobStore:
             except BaseException:
                 shutil.rmtree(directory, ignore_errors=True)
                 raise
+        self.validation.bootstrap_job(job_id, session_id)
         return self.get(root, job_id)
 
     def get(self, root: Path, job_id: str):
@@ -209,6 +213,7 @@ class JobStore:
         result['request'] = json.loads(row['payload'])
         result['artifacts'] = json.loads(row['artifacts'])
         result['attempt_number'] = row['attempt_number']
+        result['validation'] = self.validation.get(row['id'])
         root = self.base / row['session_id']
         for stream in ('stdout','stderr'):
             relative = Path('jobs') / row['id'] / 'attempts' / (row['active_token'] or 'legacy') / 'logs' / f'{stream}.log'
@@ -269,7 +274,10 @@ class JobStore:
                 if changed.rowcount != 1:
                     return None
                 claimed = db.execute('SELECT * FROM jobs WHERE id=?', (row['id'],)).fetchone()
-                return dict(claimed)
+                claimed = dict(claimed)
+                self.validation.bootstrap_job(claimed['id'], claimed['session_id'])
+                self.validation.record_attempt_started(claimed['id'], token)
+                return claimed
         return None
 
     def update_attempt(self, job_id, token, **fields):
@@ -308,3 +316,10 @@ class JobStore:
         """Retorna tentativas em andamento; a retomada depende do vencimento do lease."""
         with self.db() as db:
             return [dict(r) for r in db.execute("SELECT * FROM jobs WHERE status IN ('starting','running')")]
+
+    def decide_validation(self, root: Path, job_id: str, criterion_id: str,
+                          action: str, actor_id: str = 'local-user'):
+        """Registra uma decisão humana em critério pertencente à conversa."""
+        self.get(root, job_id)  # valida isolamento por sessão
+        self.validation.decide(job_id, criterion_id, action, actor_id)
+        return self.get(root, job_id)

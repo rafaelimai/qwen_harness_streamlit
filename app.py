@@ -231,6 +231,40 @@ def task_panel(root_path: str):
         title = f"{job['request']['script']} — {job['status']} — {job['job_id'][-8:]}"
         with st.expander(title):
             st.json({k: job[k] for k in ('job_id','status','exit_code','error','created_at','started_at','finished_at','request','artifacts')})
+            validation = job.get('validation')
+            projection = validation and validation.get('projection')
+            st.markdown('#### Validação')
+            if not projection:
+                st.caption('Contrato congelado; aguardando uma versão de resultado para avaliação.')
+            else:
+                summary = {
+                    'acceptance_status': projection['acceptance_status'],
+                    'verification_status': projection['verification_status'],
+                    'approved': projection['approved'],
+                    'approval_basis': projection['approval_basis'],
+                    'human_review_status': projection['human_review_status'],
+                }
+                st.json(summary)
+                decisions = validation.get('human_decisions', {})
+                for criterion_id, criterion in projection['criteria'].items():
+                    st.markdown(f"**{criterion['description']}**")
+                    st.caption(
+                        f"Aceitação: {criterion['effective_status']} · "
+                        f"Verificação: {criterion['verification_status']} · "
+                        f"Efeito humano: {criterion.get('decision_effect') or 'nenhum'}")
+                    accept_col, reject_col, defer_col = st.columns(3)
+                    if accept_col.button('Aceitar', key=f'accept_{job["job_id"]}_{criterion_id}'):
+                        queue.decide_validation(active_root, job['job_id'], criterion_id, 'SET_ACCEPTED')
+                        st.rerun()
+                    if reject_col.button('Rejeitar', key=f'reject_{job["job_id"]}_{criterion_id}'):
+                        queue.decide_validation(active_root, job['job_id'], criterion_id, 'SET_REJECTED')
+                        st.rerun()
+                    if defer_col.button('Usar evidência',
+                            disabled=criterion_id not in decisions,
+                            key=f'defer_{job["job_id"]}_{criterion_id}'):
+                        queue.decide_validation(active_root, job['job_id'], criterion_id,
+                                                'DEFER_TO_EVIDENCE')
+                        st.rerun()
             for stream in ('stdout','stderr'):
                 if stream + '_tail' in job:
                     st.caption(stream)
