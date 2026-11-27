@@ -42,6 +42,8 @@ if [[ "${1:-}" == '--service' ]]; then
     case "${2:-}" in
         modelo) exec bash iniciar_modelo.sh ;;
         worker) exec bash iniciar_worker.sh ;;
+        supervisor) exec bash iniciar_supervisor.sh ;;
+        coordenador) exec bash iniciar_coordenador.sh ;;
         interface) exec bash iniciar_interface.sh ;;
         *) fail 'Serviço inválido.' ;;
     esac
@@ -83,7 +85,7 @@ fi
 [[ -x "$PY" ]] || fail 'Falta .venv. Rode python3 -m venv .venv e .venv/bin/pip install -r requirements.txt na pasta da harness.'
 "$PY" -c 'import streamlit,langgraph,langchain_openai,pymupdf4llm,trafilatura,requests,psutil' \
     || fail 'Dependências ausentes; rode .venv/bin/pip install -r requirements.txt'
-for script in iniciar_modelo.sh iniciar_worker.sh iniciar_interface.sh preparar_executor.sh; do
+for script in iniciar_modelo.sh iniciar_worker.sh iniciar_supervisor.sh iniciar_coordenador.sh iniciar_interface.sh preparar_executor.sh; do
     [[ -f "$APP_DIR/$script" ]] || fail "Arquivo ausente: $script. É necessário o pacote v2 completo."
 done
 
@@ -141,6 +143,8 @@ start_window() {
 }
 [[ "$reuse_model" == 1 ]] || start_window modelo
 [[ "$reuse_worker" == 1 ]] || start_window worker
+start_window supervisor
+start_window coordenador
 start_window interface
 
 ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"

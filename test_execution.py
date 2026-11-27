@@ -14,10 +14,14 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from storage import (artifacts, create_session, decision_log, record_decision,
                      active_question_cycle, cache_followups, cached_followup,
                      question_cache, question_cycles, rename_session, session_meta,
-                     save_session_settings, session_settings, write_text_file)
+                     save_messages, load_messages, save_session_settings, session_settings,
+                     write_text_file)
 from jobs import JobStore
 from agente import _plain_options, _plain_question, build_agent, make_tools
 from worker import extract_outputs, run_job, recover, DockerEngine
+from supervisor import evaluate
+from conversation_store import ConversationConflict, ConversationStore
+from turn_coordinator import run_once as run_coordinator_once
 from security import SecurityStore, assess_content, assess_python, decision_for
 
 
@@ -44,6 +48,32 @@ def test_write_code_extension_and_overwrite(tmp_path):
     for name in ('../outside.py','/tmp/a.py','inputs/a.py','work/../../a.py'):
         with pytest.raises(ValueError):
             write_text_file(root, name, 'x')
+
+
+def test_concurrent_conversation_writers_do_not_lose_messages(tmp_path):
+    """Duas conexões reais anexam mensagens distintas sem substituir o histórico."""
+    root = create_session(tmp_path)
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def writer(text):
+        try:
+            message = HumanMessage(content=text, id='msg_' + text)
+            barrier.wait()
+            save_messages(root, [message])
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(text,)) for text in ('primeira', 'segunda')]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    loaded = load_messages(root)
+    assert {message.content for message in loaded} == {'primeira', 'segunda'}
+    assert (root / 'conversation.pre-sqlite.json').exists() is False
 
 
 def test_security_guard_explains_library_use_and_base64_payload():
@@ -199,6 +229,192 @@ def test_worker_result_and_artifact(tmp_path, result, status):
     else:
         assert projection['acceptance_status'] == 'REJECTED'
         assert projection['verification_status'] == 'REFUTED'
+
+
+def test_worker_persists_structured_observations(tmp_path):
+    """Separa fases, progresso e término do heartbeat global legado."""
+    root, store, job = setup_job(tmp_path)
+    instance = 'worker_test'
+    store.register_worker(instance, 12345)
+    row = store.claim()
+    run_job(store, row, FakeEngine(), instance)
+    projection = store.observability(root)
+    kinds = {item['kind'] for item in projection['observations']}
+    assert 'TERMINAL' in kinds
+    with store.db() as db:
+        events = db.execute('''SELECT kind,phase FROM execution_observations
+            WHERE job_id=? ORDER BY observed_at''', (job['job_id'],)).fetchall()
+    assert ('PROGRESS', 'CREATING_CONTAINER') in {(event['kind'], event['phase']) for event in events}
+    assert ('PHASE', 'EXECUTING_SCRIPT') in {(event['kind'], event['phase']) for event in events}
+
+
+def test_supervisor_is_idempotent_and_does_not_change_job(tmp_path, monkeypatch):
+    """Abre um incidente único sem cancelar, falhar ou retentar a tarefa."""
+    root, store, job = setup_job(tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    row = store.claim(at=start, lease_seconds=1000)
+    store.observe(job['job_id'], row['active_token'], 'EXECUTING_SCRIPT', 'PROGRESS',
+                  observed_at=start.isoformat())
+    monkeypatch.setattr('supervisor._docker_state', lambda name: (None, 'indisponível no teste'))
+    current = start + timedelta(seconds=300)
+    first = evaluate(store, current=current, suspected_seconds=120, stalled_seconds=240)
+    second = evaluate(store, current=current, suspected_seconds=120, stalled_seconds=240)
+    assert len(first) == 1 and second == []
+    assert store.get(root, job['job_id'])['status'] == 'starting'
+    incidents = store.observability(root)['incidents']
+    assert len(incidents) == 1
+    assert incidents[0]['health_status'] == 'STALLED'
+    assert incidents[0]['snapshot_id']
+
+
+def test_result_ready_outbox_and_continuation_are_idempotent(tmp_path):
+    """A barreira nasce depois da validação e um resultado gera uma intenção lógica."""
+    root, store, job = setup_job(tmp_path)
+    store.register_continuation(root, job['job_id'], 'op_test', 'turn_source')
+    row = store.claim()
+    run_job(store, row, FakeEngine())
+    with store.db() as db:
+        continuation = db.execute('SELECT * FROM continuation_requests').fetchall()
+        outbox = db.execute('SELECT * FROM outbox_events').fetchall()
+        publication = db.execute('SELECT * FROM result_publications').fetchall()
+    assert len(continuation) == len(outbox) == len(publication) == 1
+    assert continuation[0]['state'] == 'RESUME_PENDING'
+    validation = store.validation.get(job['job_id'])
+    assert store.publish_result_ready(job['job_id'], row['active_token'], validation)
+    with store.db() as db:
+        assert db.execute('SELECT COUNT(*) FROM outbox_events').fetchone()[0] == 1
+
+
+def test_stale_conversation_writer_is_fenced(tmp_path):
+    """Uma geração antiga não publica depois de outro titular assumir."""
+    root = create_session(tmp_path)
+    conversations = ConversationStore(tmp_path)
+    message = HumanMessage(content='pedido', id='msg_request',
+                           additional_kwargs={'turn_id': 'turn_request'})
+    save_messages(root, [message])
+    first = conversations.claim_turn(root.name, 'turn_request', 'owner-a', lease_seconds=1)
+    assert first == 1
+    with conversations.db() as db:
+        db.execute("UPDATE conversation_leases SET expires_at='2000-01-01T00:00:00+00:00'")
+        db.execute("UPDATE conversation_turns SET state='RETRY_PENDING' WHERE turn_id='turn_request'")
+    second = conversations.claim_turn(root.name, 'turn_request', 'owner-b')
+    assert second == 2
+    with pytest.raises(ConversationConflict, match='fencing'):
+        save_messages(root, [message, AIMessage(content='atrasada', id='msg_late')],
+                      owner_id='owner-a', fencing_generation=first)
+
+
+def test_coordinator_resumes_without_ui_and_deduplicates_restart(tmp_path):
+    """O coordenador publica uma resposta e não a repete após novo ciclo."""
+    root, store, job = setup_job(tmp_path)
+    save_messages(root, [HumanMessage(content='Execute e analise', id='msg_goal')])
+    store.register_continuation(root, job['job_id'], 'op_resume', 'turn_source')
+    row = store.claim()
+    run_job(store, row, FakeEngine())
+
+    class FakeGraph:
+        def invoke(self, state, config=None):
+            return {'messages': [*state['messages'], AIMessage(
+                content='Resultado analisado automaticamente.', id='msg_auto')]}
+
+    with patch('turn_coordinator.build_agent', return_value=FakeGraph()):
+        assert run_coordinator_once(tmp_path)
+        assert not run_coordinator_once(tmp_path)
+    messages = load_messages(root)
+    assert [message.content for message in messages].count(
+        'Resultado analisado automaticamente.') == 1
+    with store.db() as db:
+        assert db.execute('SELECT state FROM continuation_requests').fetchone()[0] == 'COMPLETED'
+        assert db.execute('SELECT status FROM outbox_events').fetchone()[0] == 'CONSUMED'
+
+
+def test_run_python_replay_with_new_model_call_id_reuses_job(tmp_path):
+    """Regeneração do mesmo turno usa operation_key estável, não o call id da LLM."""
+    root = create_session(tmp_path)
+    write_text_file(root, 'work/test.py', 'print(1)')
+
+    class ReplayModel:
+        sequence = 0
+        def __init__(self, **kwargs):
+            pass
+        def bind_tools(self, tools):
+            return self
+        def invoke(self, messages):
+            type(self).sequence += 1
+            return AIMessage(content='', tool_calls=[{
+                'id': f'call_{self.sequence}', 'name': 'run_python',
+                'args': {'script': 'work/test.py'}, 'type': 'tool_call'}])
+
+    with patch('agente.ChatOpenAI', ReplayModel):
+        for _ in range(2):
+            build_agent(root, 'http://localhost:8080/v1', 'qwen', 0, 128,
+                        turn_id='turn_replayed').invoke(
+                {'messages': [HumanMessage(content='Execute')]},
+                config={'recursion_limit': 8})
+    store = JobStore(tmp_path)
+    assert len(store.list(root)) == 1
+    with store.db() as db:
+        assert db.execute('SELECT COUNT(*) FROM tool_operations').fetchone()[0] == 1
+        assert db.execute('SELECT COUNT(*) FROM continuation_requests').fetchone()[0] == 1
+
+
+def test_coordinator_recovers_crash_after_message_before_ack(tmp_path):
+    """Saída confirmada é reconhecida sem uma segunda inferência após perda do lease."""
+    root, store, job = setup_job(tmp_path)
+    save_messages(root, [HumanMessage(content='Objetivo', id='msg_original')])
+    continuation = store.register_continuation(
+        root, job['job_id'], 'op_crash', 'turn_source')
+    row = store.claim()
+    run_job(store, row, FakeEngine())
+    conversations = ConversationStore(tmp_path)
+    turn_id = 'turn_' + continuation['continuation_id']
+    conversations.register_turn(root.name, turn_id, 'CONTINUATION')
+    generation = conversations.claim_turn(root.name, turn_id, 'dead-owner')
+    assert store.begin_continuation(continuation['continuation_id'], turn_id, generation)
+    confirmed = AIMessage(content='Resposta já confirmada.', id='msg_confirmed',
+                          additional_kwargs={'turn_id': turn_id})
+    save_messages(root, [*load_messages(root), confirmed], owner_id='dead-owner',
+                  fencing_generation=generation)
+    with conversations.db() as db:
+        db.execute('DELETE FROM conversation_leases WHERE session_id=?', (root.name,))
+
+    with patch('turn_coordinator.build_agent', side_effect=AssertionError('não deve inferir')):
+        assert run_coordinator_once(tmp_path)
+    assert [message.content for message in load_messages(root)].count(
+        'Resposta já confirmada.') == 1
+    with store.db() as db:
+        state = db.execute('SELECT state FROM continuation_requests').fetchone()[0]
+    assert state == 'COMPLETED'
+
+
+def test_human_message_before_claim_has_priority_over_continuation(tmp_path):
+    """P-02: entrada humana pendente é processada antes do resultado disponível."""
+    root, store, job = setup_job(tmp_path)
+    save_messages(root, [HumanMessage(content='Objetivo', id='msg_goal')])
+    store.register_continuation(root, job['job_id'], 'op_priority', 'turn_source')
+    row = store.claim()
+    run_job(store, row, FakeEngine())
+    human = HumanMessage(content='Nova orientação', id='msg_human',
+                         additional_kwargs={'turn_id': 'turn_human'})
+    save_messages(root, [*load_messages(root), human])
+
+    class PriorityGraph:
+        calls = 0
+        def invoke(self, state, config=None):
+            type(self).calls += 1
+            return {'messages': [*state['messages'], AIMessage(
+                content=f'Resposta {self.calls}', id=f'msg_priority_{self.calls}')]}
+
+    with patch('turn_coordinator.build_agent', return_value=PriorityGraph()):
+        assert run_coordinator_once(tmp_path)
+        with store.db() as db:
+            state = db.execute('SELECT state FROM continuation_requests').fetchone()[0]
+        assert state == 'RESUME_PENDING'
+        assert run_coordinator_once(tmp_path)
+    with store.db() as db:
+        assert db.execute('SELECT state FROM continuation_requests').fetchone()[0] == 'COMPLETED'
+    contents = [message.content for message in load_messages(root)]
+    assert contents.index('Nova orientação') < contents.index('Resposta 1') < contents.index('Resposta 2')
 
 
 def test_worker_cancellation(tmp_path):
