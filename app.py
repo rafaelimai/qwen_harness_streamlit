@@ -13,15 +13,16 @@ import psutil
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, messages_from_dict
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from agente import _clean_option, build_agent, complete_pending_calls
 from ingestao import build_ingestion
 from jobs import JobStore, TERMINAL, data_dir
 from security import SecurityStore, assess_file, format_alerts, safe_to_display
-from storage import (artifacts, create_session, safe_name, save_messages,
+from storage import (artifacts, create_session, safe_name, save_messages, load_messages,
                      decision_log, question_cycles, record_decision,
                      save_session_settings, session_meta, session_settings,
                      rename_session)
+from conversation_store import ConversationStore
 
 st.set_page_config(page_title='Qwen · Homelab', page_icon='🧪', layout='wide')
 BASE = data_dir()
@@ -121,6 +122,7 @@ llm_defaults = {
 }
 saved_llm = session_settings(root, llm_defaults)
 store = JobStore(BASE)
+st.session_state.messages = load_messages(root)
 
 with st.sidebar:
     st.title('🧪 Qwen · Homelab')
@@ -144,9 +146,8 @@ with st.sidebar:
                             index=next((i for i,p in enumerate(sessions) if p == root), 0))
     if st.button('Abrir conversa'):
         chosen = BASE / selected
-        history = chosen / 'conversation.json'
         try:
-            messages = messages_from_dict(json.loads(history.read_text(encoding='utf-8'))) if history.exists() else []
+            messages = load_messages(chosen)
             messages.extend(complete_pending_calls(messages))
             st.session_state.root = str(chosen)
             st.session_state.messages = messages
@@ -277,12 +278,64 @@ def task_panel(root_path: str):
                 if st.button('Cancelar tarefa', key='cancel_' + job['job_id']):
                     queue.cancel(active_root, job['job_id'])
                     st.rerun()
-            elif st.button('Analisar resultado', key='analyze_' + job['job_id']):
+            elif st.button('Reanalisar manualmente', key='analyze_' + job['job_id']):
                 st.session_state.pending_prompt = (
                     f"Consulte get_job_status para a tarefa {job['job_id']}. "
                     'Analise os logs e os artefatos. Explique o resultado ou a causa do erro. '
                     'Não enfileire nova execução sem eu pedir.')
                 st.rerun()
+
+
+@st.fragment(run_every='3s')
+def conversation_task_status(root_path: str):
+    """Mostra tarefas e saúde no chat sem transformar eventos em prompts."""
+    active_root = Path(root_path)
+    queue = JobStore(active_root.parent)
+    jobs = queue.list(active_root)
+    if not jobs:
+        return
+    operational = queue.observability(active_root)
+    observations = operational['observations']
+    incidents = {}
+    for item in operational['incidents']:
+        incidents.setdefault(item['job_id'], item)
+    continuations = {item['job_id']: item for item in operational['continuations']}
+    st.markdown('#### Execuções desta conversa')
+    for job in jobs:
+        incident = incidents.get(job['job_id'])
+        continuation = continuations.get(job['job_id'])
+        observation = next((item for item in observations
+                            if item['job_id'] == job['job_id']), None)
+        validation = job.get('validation', {}).get('projection') or {}
+        with st.container(border=True):
+            icon = ('✅' if job['status'] == 'succeeded'
+                    else '⚠️' if incident and not incident['resolved_at'] else '⏳')
+            st.markdown(f"{icon} **{job['request']['script']}** · `{job['job_id'][-8:]}`")
+            cols = st.columns(3)
+            cols[0].caption('Execução')
+            cols[0].markdown(f"**{job['status'].upper()}**")
+            cols[1].caption('Saúde')
+            health = incident['health_status'] if incident and not incident['resolved_at'] else 'NORMAL'
+            cols[1].markdown(f"**{health}**")
+            cols[2].caption('Validação')
+            cols[2].markdown(f"**{validation.get('verification_status', 'UNVERIFIED')}**")
+            if observation:
+                st.caption(f"Fase: {observation['phase']} · último evento: {observation['observed_at']}")
+            if incident and not incident['resolved_at']:
+                st.warning(incident['detail'] + ' A tarefa não foi cancelada nem reiniciada.')
+            elif job['status'] not in TERMINAL:
+                st.caption('Aguardando conclusão da tarefa para continuar.')
+            if continuation:
+                labels = {
+                    'WAITING_FOR_JOB': 'Aguardando resultado para continuar',
+                    'RESUME_PENDING': 'Continuação em preparação',
+                    'RESUMING': 'Retomando análise do resultado',
+                    'RETRY_PENDING': 'Nova tentativa da continuação agendada',
+                    'WAITING_FOR_USER': 'Aguardando resposta ou aprovação humana',
+                    'COMPLETED': 'Continuação concluída',
+                    'CONTINUATION_ERROR': 'Continuação requer intervenção manual',
+                }
+                st.caption(labels.get(continuation['state'], continuation['state']))
 
 
 def system_temperature():
@@ -425,6 +478,7 @@ with monitor_tab:
 
 with chat_tab:
     st.caption('Exemplo: “Crie um script Python, salve em work/exemplo.py e execute.”')
+    conversation_task_status(str(root))
     for message in st.session_state.messages:
         if isinstance(message, HumanMessage):
             with st.chat_message('user'):
@@ -549,6 +603,7 @@ with chat_tab:
     pending = st.session_state.pop('pending_prompt', None)
     submitted = prompt if prompt else pending
     if submitted:
+        turn_id = 'turn_' + uuid4().hex
         if isinstance(submitted, dict):
             prompt_content = submitted['content']
             prompt_display = submitted.get('display', prompt_content)
@@ -562,6 +617,7 @@ with chat_tab:
         st.session_state.messages.append(HumanMessage(
             content=prompt_content,
             additional_kwargs={
+                'turn_id': turn_id,
                 **prompt_metadata,
                 **({'display_content': prompt_display} if prompt_display != prompt_content else {}),
             }))
@@ -569,26 +625,43 @@ with chat_tab:
         with st.chat_message('user'):
             st.markdown(prompt_display)
         scroll_to_latest()
-        try:
-            graph = build_agent(root, base_url.strip(), model.strip(), temperature, int(max_tokens))
-            with st.status('Consultando Qwen…', expanded=True) as status:
-                for update in graph.stream({'messages': st.session_state.messages},
-                                           config={'recursion_limit': 24}, stream_mode='updates'):
-                    for node, delta in update.items():
-                        new_messages = delta.get('messages', [])
-                        st.session_state.messages.extend(new_messages)
-                        save_messages(root, st.session_state.messages)
-                        scroll_to_latest()
-                        for message in new_messages:
-                            if isinstance(message, AIMessage) and message.tool_calls:
-                                st.write('Executando ferramenta: ' + ', '.join(c['name'] for c in message.tool_calls))
-                            elif isinstance(message, ToolMessage):
-                                st.write('Resultado da ferramenta recebido.')
-                status.update(label='Turno concluído', state='complete', expanded=False)
-        except Exception as exc:
-            st.session_state.messages.extend(complete_pending_calls(st.session_state.messages))
-            st.session_state.messages.append(AIMessage(content=f'Não foi possível concluir: {exc}'))
-            save_messages(root, st.session_state.messages)
+        conversations = ConversationStore(BASE)
+        owner_id = 'ui_' + uuid4().hex
+        generation = conversations.claim_turn(root.name, turn_id, owner_id)
+        if generation is None:
+            st.info('Mensagem preservada e enfileirada para o próximo turno da conversa.')
+        else:
+            turn_error = None
+            try:
+                graph = build_agent(root, base_url.strip(), model.strip(), temperature,
+                                    int(max_tokens), turn_id=turn_id)
+                with st.status('Consultando Qwen…', expanded=True) as status:
+                    for update in graph.stream({'messages': st.session_state.messages},
+                                               config={'recursion_limit': 24}, stream_mode='updates'):
+                        for node, delta in update.items():
+                            new_messages = delta.get('messages', [])
+                            for message in new_messages:
+                                message.additional_kwargs['turn_id'] = turn_id
+                            st.session_state.messages.extend(new_messages)
+                            save_messages(root, st.session_state.messages, owner_id=owner_id,
+                                          fencing_generation=generation)
+                            scroll_to_latest()
+                            for message in new_messages:
+                                if isinstance(message, AIMessage) and message.tool_calls:
+                                    st.write('Executando ferramenta: ' + ', '.join(c['name'] for c in message.tool_calls))
+                                elif isinstance(message, ToolMessage):
+                                    st.write('Resultado da ferramenta recebido.')
+                    status.update(label='Turno concluído', state='complete', expanded=False)
+            except Exception as exc:
+                turn_error = str(exc)[:2000]
+                repaired = complete_pending_calls(st.session_state.messages)
+                error_message = AIMessage(content=f'Não foi possível concluir: {exc}',
+                                          additional_kwargs={'turn_id': turn_id})
+                st.session_state.messages.extend([*repaired, error_message])
+                save_messages(root, st.session_state.messages, owner_id=owner_id,
+                              fencing_generation=generation)
+            finally:
+                conversations.finish_turn(root.name, turn_id, owner_id, generation, turn_error)
         st.rerun()
     scroll_to_latest()
 

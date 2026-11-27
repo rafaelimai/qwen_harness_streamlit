@@ -10,7 +10,7 @@ Implementado nesta versão:
 Ainda não implementado:
 - Checkpoints duráveis do LangGraph para retomar no ponto interno de um nó.
   O histórico da conversa e os jobs persistem; jobs ambíguos não são repetidos.
-- Continuação automática do agente quando um job acaba. Use Analisar resultado.
+- Continuidade automática do agente quando um job acaba, com outbox, `RESULT_READY`, fencing por conversa e replay idempotente de `run_python`.
 - Gestão de contexto/token budget e resumo automático de histórico.
 - Testes/evals com seu Qwen real: uso correto de ferramentas, seleção de parâmetros,
   respostas a erros e qualidade dos resultados.

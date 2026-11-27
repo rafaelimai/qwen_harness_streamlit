@@ -211,6 +211,17 @@ def make_tools(root: Path, reviewer=None, runtime_context: dict | None = None):
     runtime_context = runtime_context if runtime_context is not None else {}
     (root / 'work').mkdir(exist_ok=True)  # migração de conversas da versão anterior
 
+    def effect(tool_name: str, arguments: dict, action):
+        """Jornaliza efeitos locais antes do despacho e reaproveita replays."""
+        runtime_context['tool_ordinal'] = int(runtime_context.get('tool_ordinal', 0)) + 1
+        operation = store.prepare_operation(
+            runtime_context.get('turn_id') or ('turn_' + uuid4().hex),
+            runtime_context['tool_ordinal'], tool_name, arguments)
+        if operation['status'] == 'COMPLETED':
+            return operation['result']
+        result = action(operation)
+        return store.complete_operation(operation['operation_id'], result)
+
     def assess_input(text: str, source: str, can_authorize: bool = False) -> dict:
         assessment = assess_content(text, source, can_authorize)
         review = _semantic_content_review(reviewer, text=text, source=source, assessment=assessment)
@@ -304,17 +315,37 @@ def make_tools(root: Path, reviewer=None, runtime_context: dict | None = None):
     @tool
     def write_file(path: str, content: str, overwrite: bool = False) -> dict:
         """Grava texto UTF-8 em work/ ou outputs/, mantendo extensão. Não executa o arquivo."""
-        result = write_text_file(root, path, content, overwrite)
-        result['security'] = assess_python(content) if Path(path).suffix == '.py' else assess_input(
-            content, 'generated_file', False)
-        return result
+        def perform(_operation):
+            try:
+                result = write_text_file(root, path, content, overwrite)
+            except ValueError as exc:
+                target = inside(root, path)
+                if 'já existe' not in str(exc) or not target.is_file() or target.read_text(
+                        encoding='utf-8') != content:
+                    raise
+                result = {'artifact_path': str(target.relative_to(root)),
+                          'size_bytes': target.stat().st_size}
+            result['security'] = (assess_python(content) if Path(path).suffix == '.py'
+                                  else assess_input(content, 'generated_file', False))
+            return result
+        return effect('write_file', {'path': path, 'content': content, 'overwrite': overwrite}, perform)
 
     @tool
     def save_markdown(filename: str, content: str) -> dict:
         """Compatibilidade: grava relatório Markdown em outputs/. Prefira write_file para outros formatos."""
         from storage import safe_name
         name = Path(safe_name(filename)).stem + '.md'
-        return write_text_file(root, f'outputs/{uuid4().hex[:8]}_{name}', content)
+        def perform(operation):
+            path = f"outputs/{operation['operation_id'][-8:]}_{name}"
+            try:
+                return write_text_file(root, path, content)
+            except ValueError as exc:
+                target = inside(root, path)
+                if 'já existe' not in str(exc) or not target.is_file() or target.read_text(
+                        encoding='utf-8') != content:
+                    raise
+                return {'artifact_path': path, 'size_bytes': target.stat().st_size}
+        return effect('save_markdown', {'filename': filename, 'content': content}, perform)
 
     @tool
     def run_python(script: str, tool_call_id: Annotated[str, InjectedToolCallId],
@@ -352,10 +383,26 @@ def make_tools(root: Path, reviewer=None, runtime_context: dict | None = None):
                 return {'awaiting_approval': True, 'security_decision_id': record['id'],
                         'script': script, 'purpose': record['purpose'], 'risk': assessment['risk'],
                         'alerts': format_alerts(assessment)}
-        return store.enqueue(root, script, arguments, timeout_seconds, tool_call_id,
-                             security={'decision_id': record['id'], 'script_sha256': digest,
-                                       'policy_version': record['policy_version'],
-                                       'risk': record['assessment']['risk']})
+        runtime_context['tool_ordinal'] = int(runtime_context.get('tool_ordinal', 0)) + 1
+        store.enforce_automation_budget(
+            runtime_context['root_turn_id'], int(runtime_context.get('continuation_depth', 0)))
+        operation = store.prepare_operation(
+            runtime_context['turn_id'], runtime_context['tool_ordinal'], 'run_python', {
+                'script': script, 'arguments': arguments, 'timeout_seconds': timeout_seconds,
+                'purpose': purpose, 'approval_id': approval_id,
+            })
+        if operation['status'] == 'COMPLETED':
+            return operation['result']
+        job = store.enqueue(root, script, arguments, timeout_seconds, operation['operation_key'],
+                            security={'decision_id': record['id'], 'script_sha256': digest,
+                                      'policy_version': record['policy_version'],
+                                      'risk': record['assessment']['risk']})
+        store.register_continuation(
+            root, job['job_id'], operation['operation_id'],
+            runtime_context.get('turn_id') or ('turn_' + tool_call_id),
+            int(runtime_context.get('continuation_depth', 0)),
+            runtime_context.get('root_turn_id'))
+        return store.complete_operation(operation['operation_id'], job)
 
     @tool
     def get_job_status(job_id: str) -> dict:
@@ -368,7 +415,8 @@ def make_tools(root: Path, reviewer=None, runtime_context: dict | None = None):
     @tool
     def cancel_job(job_id: str) -> dict:
         """Solicita cancelamento. Se em execução, o worker encerra o contêiner inteiro."""
-        return store.cancel(root, job_id)
+        return effect('cancel_job', {'job_id': job_id},
+                      lambda _operation: store.cancel(root, job_id))
 
     @tool
     def ask_user(question: str, options: list[str] | None = None,
@@ -386,17 +434,27 @@ def make_tools(root: Path, reviewer=None, runtime_context: dict | None = None):
         normalized = [option.casefold() for option in cleaned]
         if len(set(normalized)) != len(normalized):
             raise ValueError('As opções devem ser distintas; "Outros" é adicionada pela interface.')
-        cycle = ensure_question_cycle(root, cycle_goal, definition_of_done)
-        return {'awaiting_user': True, 'question': question.strip(),
-                'options': cleaned, 'question_cycle': cycle}
+        def perform(_operation):
+            cycle = ensure_question_cycle(root, cycle_goal, definition_of_done)
+            return {'awaiting_user': True, 'question': question.strip(),
+                    'options': cleaned, 'question_cycle': cycle}
+        return effect('ask_user', {
+            'question': question.strip(), 'options': cleaned, 'cycle_goal': cycle_goal,
+            'definition_of_done': definition_of_done or [],
+        }, perform)
 
     return [list_files, ingest_document, read_file, search_files, write_file,
             save_markdown, run_python, get_job_status, cancel_job, ask_user]
 
 
-def build_agent(root: Path, base_url: str, model: str, temperature: float, max_tokens: int):
+def build_agent(root: Path, base_url: str, model: str, temperature: float, max_tokens: int,
+                turn_id: str | None = None, continuation_depth: int = 0,
+                root_turn_id: str | None = None):
     """Monta e compila o grafo do agente para uma conversa e um modelo local."""
-    runtime_context = {}
+    active_turn_id = turn_id or ('turn_' + uuid4().hex)
+    runtime_context = {'turn_id': active_turn_id,
+                       'root_turn_id': root_turn_id or active_turn_id,
+                       'continuation_depth': continuation_depth}
     raw_llm = ChatOpenAI(base_url=base_url, api_key='local', model=model,
                          temperature=temperature, max_tokens=max_tokens,
                          timeout=1800, max_retries=0)
@@ -520,7 +578,8 @@ def build_agent(root: Path, base_url: str, model: str, temperature: float, max_t
             text = result['question']
         else:
             text = (f"Tarefa `{result['job_id']}` registrada com status **{result['status']}**. "
-                    'Acompanhe na aba **Tarefas**. Quando terminar, clique em **Analisar resultado**.')
+                    'A harness acompanhará a execução nesta conversa. A retomada automática '
+                    'da análise será habilitada pelo coordenador de continuidade.')
         return {'messages': [AIMessage(content=text)]}
 
     graph = StateGraph(MessagesState)

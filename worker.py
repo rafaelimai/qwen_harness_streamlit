@@ -12,11 +12,44 @@ import tarfile
 import threading
 import time
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from jobs import JobStore, data_dir, now, MAX_OUTPUT_BYTES, MAX_OUTPUT_FILES
 
 IMAGE = os.environ.get('HARNESS_RUNNER_IMAGE', 'qwen-harness-runner:1')
 LOG_LIMIT = 4 * 1024 * 1024  # por fluxo; excedentes encerram o job
+
+
+class WorkerHeartbeat:
+    """Mantém vitalidade por instância sem confundi-la com progresso."""
+
+    def __init__(self, store, instance_id):
+        self.store = store
+        self.instance_id = instance_id
+        self.job_id = self.attempt_id = None
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name='worker-heartbeat', daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def set_attempt(self, row=None):
+        self.job_id = row['id'] if row else None
+        self.attempt_id = row['active_token'] if row else None
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            try:
+                self.store.heartbeat()
+                self.store.heartbeat_instance(self.instance_id, self.job_id, self.attempt_id)
+            except Exception:
+                # O supervisor detectará a lacuna; telemetria não derruba o executor.
+                pass
+            self.stop_event.wait(2)
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join(timeout=5)
 
 
 def container_name(row):
@@ -142,7 +175,7 @@ def collect_log(pipe, target, overflow):
     pipe.close()
 
 
-def run_job(store, row, engine):
+def run_job(store, row, engine, worker_instance_id=None):
     """Executa uma tarefa reservada e publica seu estado, logs e artefatos."""
     token = row['active_token']
     root = store.base / row['session_id']
@@ -156,7 +189,14 @@ def run_job(store, row, engine):
     threads = []
     overflow = threading.Event()
     status, error, code, published = 'failed', None, None, []
+    def observer(phase, kind, detail=None, metadata=None):
+        try:
+            store.observe(row['id'], token, phase, kind, worker_instance_id, detail, metadata)
+        except Exception:
+            # A execução não depende do canal auxiliar de observabilidade.
+            pass
     try:
+        observer('CLAIMING', 'PHASE', 'Tentativa reservada pelo worker.')
         if store.get(root, row['id'])['cancel_requested']:
             status = 'cancelled'
         else:
@@ -166,10 +206,16 @@ def run_job(store, row, engine):
                 frozen_script = jobdir / 'snapshot' / request['script']
                 if sha256(frozen_script.read_bytes()).hexdigest() != security['script_sha256']:
                     raise ValueError('Hash do script diverge da decisão de segurança.')
+            observer('CREATING_CONTAINER', 'PHASE', metadata={'container_name': container_name(row)})
             engine.create(row, jobdir / 'snapshot')
+            observer('CREATING_CONTAINER', 'PROGRESS', 'Contêiner criado.',
+                     {'container_name': container_name(row)})
             if not store.update_attempt(row['id'], token, status='running'):
+                observer('CREATING_CONTAINER', 'ABANDONED', 'Token deixou de ser vigente.')
                 return
             process = engine.start(row)
+            observer('EXECUTING_SCRIPT', 'PHASE', 'Runner iniciado.',
+                     {'container_name': container_name(row)})
             for name in ('stdout', 'stderr'):
                 thread = threading.Thread(target=collect_log,
                     args=(getattr(process,name), logs / f'{name}.log', overflow), daemon=True)
@@ -181,6 +227,7 @@ def run_job(store, row, engine):
                 store.heartbeat()
                 if not store.token_is_active(row['id'], token):
                     # Outra tentativa tomou posse; o finally encerra somente este contêiner.
+                    observer('EXECUTING_SCRIPT', 'ABANDONED', 'Tentativa perdeu o token vigente.')
                     break
                 if store.get(root, row['id'])['cancel_requested']:
                     status = 'cancelled'
@@ -193,11 +240,14 @@ def run_job(store, row, engine):
                     break
                 result = engine.result(row)
                 if result is not None:
+                    observer('COLLECTING_ARTIFACTS', 'PROGRESS', 'Runner entregou resultado.')
                     code = result['exit_code']
                     status = 'timed_out' if result['timed_out'] else ('succeeded' if code == 0 else 'failed')
                     if status != 'succeeded':
                         error = 'Tempo limite excedido.' if result['timed_out'] else f'Python terminou com código {code}.'
                     files = engine.export(row, temp)
+                    observer('PUBLISHING_RESULT', 'PHASE',
+                             f'{len(files)} artefato(s) coletado(s).')
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     temp.rename(destination)
                     published = [str(destination / p.relative_to(temp)) for p in files]
@@ -243,7 +293,17 @@ def run_job(store, row, engine):
                     'digest': 'sha256:' + sha256(artifact.read_bytes()).hexdigest(),
                     'size_bytes': artifact.stat().st_size,
                 })
-            store.validation.record_job_result(row['id'], token, status, manifest_artifacts)
+            try:
+                validation = store.validation.record_job_result(
+                    row['id'], token, status, manifest_artifacts)
+                store.publish_result_ready(row['id'], token, validation)
+            except Exception as exc:
+                # O reconciliador formaliza a validação indisponível ou conclui a publicação.
+                observer('PUBLISHING_RESULT', 'ACTIVITY',
+                         'Resultado operacional persistido; publicação pendente.',
+                         {'error': str(exc)[:500]})
+            observer('FINISHED', 'TERMINAL', status,
+                     {'exit_code': code, 'artifact_count': len(published)})
         if not accepted and destination.exists():
             shutil.rmtree(destination, ignore_errors=True)
 
@@ -259,10 +319,15 @@ def main():
     parser.add_argument('--once', action='store_true', help='Processa no máximo um job e encerra.')
     args = parser.parse_args()
     store = JobStore()
+    worker_instance_id = 'worker_' + uuid4().hex
+    store.register_worker(worker_instance_id, os.getpid())
+    heartbeat = WorkerHeartbeat(store, worker_instance_id)
+    heartbeat.start()
     engine = DockerEngine()
     try:
         engine.preflight()
     except Exception as exc:
+        heartbeat.stop()
         raise SystemExit(f'Worker não iniciou: {exc}\nExecute bash preparar_executor.sh e confira docker info.')
     recover(store, engine)
     print('Worker ativo. Uma tarefa por vez neste processo; a fila aceita múltiplos workers.', flush=True)
@@ -272,13 +337,17 @@ def main():
             row = store.claim()
             if row:
                 print(f"Executando {row['id']} tentativa {row['attempt_number']}", flush=True)
-                run_job(store, row, engine)
+                heartbeat.set_attempt(row)
+                run_job(store, row, engine, worker_instance_id)
+                heartbeat.set_attempt()
             if args.once:
                 return
             if not row:
                 time.sleep(1)
     except KeyboardInterrupt:
         print('Worker encerrado.', flush=True)
+    finally:
+        heartbeat.stop()
 
 
 if __name__ == '__main__':

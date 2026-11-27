@@ -37,13 +37,17 @@ def artifacts(root: Path) -> list[Path]:
                   and p.resolve().is_relative_to(root.resolve()))
 
 
-def save_messages(root: Path, messages: list) -> None:
-    """Persiste atomicamente o histórico serializado de uma conversa."""
-    from langchain_core.messages import messages_to_dict
-    path = root / 'conversation.json'
-    temp = path.with_suffix('.tmp')
-    temp.write_text(json.dumps(messages_to_dict(messages), ensure_ascii=False, indent=2), encoding='utf-8')
-    temp.replace(path)
+def save_messages(root: Path, messages: list, *, owner_id: str | None = None,
+                  fencing_generation: int | None = None) -> None:
+    """Anexa mensagens ao SQLite; conversation.json é apenas exportação."""
+    from conversation_store import ConversationStore
+    ConversationStore(root.parent).append(root, messages, owner_id, fencing_generation)
+
+
+def load_messages(root: Path) -> list:
+    """Carrega o histórico da fonte de verdade SQLite."""
+    from conversation_store import ConversationStore
+    return ConversationStore(root.parent).load(root)
 
 
 def write_text_file(root: Path, relative: str, content: str, overwrite: bool = False) -> dict:

@@ -112,7 +112,7 @@ Com o `llama-server`, o modelo GGUF e o Docker já preparados, execute:
 bash iniciar_tudo.sh
 ```
 
-O inicializador cria uma sessão `tmux` com o modelo, o worker e a interface. A interface sobe imediatamente; a aba **Sistema** permite acompanhar o carregamento até a API do modelo ficar pronta. Acesse o endereço exibido no terminal, normalmente:
+O inicializador cria uma sessão `tmux` com o modelo, o worker, o supervisor passivo, o coordenador de turnos e a interface. A interface sobe imediatamente; a aba **Sistema** permite acompanhar o carregamento até a API do modelo ficar pronta. Acesse o endereço exibido no terminal, normalmente:
 
 ```text
 http://IP_DO_HOMELAB:8501
@@ -127,7 +127,7 @@ bash iniciar_tudo.sh status
 # Abrir a sessão tmux
 bash iniciar_tudo.sh attach
 
-# Encerrar modelo, worker e interface gerenciados pela sessão
+# Encerrar todos os serviços gerenciados pela sessão
 bash encerrar_tudo.sh
 ```
 
@@ -168,7 +168,9 @@ Um pedido completo pode ser feito diretamente no chat:
 
 > Crie `work/exemplo.py` usando apenas a biblioteca padrão. Gere `outputs/resultado.csv` com os quadrados de 1 a 10, imprima um resumo e execute o script.
 
-O agente grava o script e enfileira a execução. A aba **Tarefas** exibe o estado, os logs e os artefatos. Ao final, use **Analisar resultado** para pedir ao modelo uma avaliação da execução.
+O agente grava o script e enfileira a execução. A conversa exibe estado, saúde operacional, validação e o estado da continuação; a aba **Tarefas** mantém logs, artefatos e detalhes. Quando resultado, manifesto e estado conhecido de validação alcançam a barreira `RESULT_READY`, o coordenador retoma o objetivo automaticamente, inclusive com o navegador fechado. **Reanalisar manualmente** permanece como intervenção opcional.
+
+O histórico gravável usa mensagens append-only no `jobs.sqlite3`. `conversation.json` é apenas uma exportação de compatibilidade; conversas antigas são migradas uma vez e recebem o backup `conversation.pre-sqlite.json`.
 
 ### Validação dos resultados
 
@@ -352,6 +354,9 @@ Esse teste verifica sucesso, falha Python, timeout, cancelamento, snapshot somen
 ├── jobs.py                   fila SQLite e snapshots
 ├── validation.py             reducers, eventos e projeções de validação
 ├── worker.py                 execução e lifecycle dos contêineres
+├── supervisor.py             detecção passiva e snapshots de incidentes
+├── turn_coordinator.py       continuação automática com fencing
+├── conversation_store.py     mensagens append-only e leases de conversa
 ├── sandbox/
 │   ├── Dockerfile            imagem do executor
 │   └── runner.py             processo interno do contêiner
@@ -359,6 +364,8 @@ Esse teste verifica sucesso, falha Python, timeout, cancelamento, snapshot somen
 ├── encerrar_tudo.sh         encerramento seguro da sessão tmux
 ├── iniciar_modelo.sh         servidor llama.cpp
 ├── iniciar_worker.sh         worker da fila
+├── iniciar_supervisor.sh     supervisor passivo
+├── iniciar_coordenador.sh    coordenador de turnos
 ├── iniciar_interface.sh      aplicação Streamlit
 ├── preparar_executor.sh      construção da imagem Docker
 ├── verificar_executor.sh     integração com Docker real
